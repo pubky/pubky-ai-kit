@@ -26,6 +26,8 @@ Pubky is an open protocol for per-public-key backends enabling censorship-resist
 - Key-value store accessed via HTTP methods (PUT, GET, DELETE)
 - Supports both public and private data (current implementations focus on public data)
 - Can be operated by individuals, cooperatives, or commercial entities
+- Persistence backends: Files, LMDB, or SQL (PostgreSQL)
+- Default per-request payload limit: **10 MB** (returns `413` past that). This is independent of per-user quotas, which are operator-defined — for reference, Synonym's public homeserver enforces 1 GB per user with a 10 MB per file ceiling.
 
 **Pkarr Network** - Distributed DNS alternative
 - Uses public keys as domains via Mainline DHT
