@@ -551,65 +551,54 @@ async function uploadFileWithMetadata(session, specs, fileData, metadata) {
 
 ```javascript
 import { useState, useEffect } from 'react';
-import init, { PubkySpecsBuilder } from 'pubky-app-specs';
+import { PubkySpecsBuilder } from 'pubky-app-specs';
 
 function usePubkySpecs(pubkyId) {
   const [specs, setSpecs] = useState(null);
   const [isReady, setIsReady] = useState(false);
   const [error, setError] = useState(null);
-  
+
   useEffect(() => {
-    async function initializeSpecs() {
-      try {
-        await init();
-        const specsBuilder = new PubkySpecsBuilder(pubkyId);
-        setSpecs(specsBuilder);
-        setIsReady(true);
-      } catch (err) {
-        setError(err.message);
-      }
-    }
-    
-    if (pubkyId) {
-      initializeSpecs();
+    if (!pubkyId) return;
+    try {
+      setSpecs(new PubkySpecsBuilder(pubkyId));
+      setIsReady(true);
+    } catch (err) {
+      setError(err.message);
     }
   }, [pubkyId]);
-  
+
   return { specs, isReady, error };
 }
 
 // Usage in component
-function PostCreator({ client, pubkyId }) {
+function PostCreator({ session, pubkyId }) {
   const { specs, isReady, error } = usePubkySpecs(pubkyId);
   const [content, setContent] = useState('');
-  
+
   const handleSubmit = async (e) => {
     e.preventDefault();
-    
+
     if (!specs || !isReady) return;
-    
+
     try {
       const postResult = specs.createPost(content, PubkyAppPostKind.Short);
-      
-      await client.fetch(postResult.meta.url, {
-        method: 'PUT',
-        body: JSON.stringify(postResult.post.toJson()),
-        credentials: 'include'
-      });
-      
+
+      await session.storage.putJson(postResult.meta.path, postResult.post.toJson());
+
       console.log('Post created:', postResult.meta.url);
       setContent('');
     } catch (err) {
       console.error('Failed to create post:', err.message);
     }
   };
-  
+
   if (error) return <div>Error: {error}</div>;
   if (!isReady) return <div>Loading specs...</div>;
-  
+
   return (
     <form onSubmit={handleSubmit}>
-      <textarea 
+      <textarea
         value={content}
         onChange={(e) => setContent(e.target.value)}
         placeholder="What's on your mind?"
@@ -1065,62 +1054,41 @@ test('data operations with validation', async (t) => {
 
 ```javascript
 import { createContext, useContext, useEffect, useState } from 'react';
-import { Client, Keypair, PublicKey, decryptRecoveryFile } from '@synonymdev/pubky';
-import init, { PubkySpecsBuilder } from 'pubky-app-specs';
+import { Pubky, Keypair, Session } from '@synonymdev/pubky';
+import { PubkySpecsBuilder } from 'pubky-app-specs';
 
 const PubkyContext = createContext();
+const SESSION_KEY = 'pubky_session';
 
 export function PubkyProvider({ children }) {
-  const [client] = useState(() => Client.testnet());
-  const [currentUser, setCurrentUser] = useState(null);
+  const [pubky] = useState(() => Pubky.testnet());
   const [session, setSession] = useState(null);
   const [specs, setSpecs] = useState(null);
 
+  // Restore an exported session on mount.
   useEffect(() => {
-    const savedUser = localStorage.getItem('pubky_user');
-    if (savedUser) {
-      checkSession(PublicKey.from(savedUser));
-    }
-  }, []);
+    const exported = localStorage.getItem(SESSION_KEY);
+    if (!exported) return;
+    pubky.restoreSession(exported)
+      .then(setSession)
+      .catch(() => localStorage.removeItem(SESSION_KEY));
+  }, [pubky]);
 
+  // Re-create the specs builder whenever the session changes.
   useEffect(() => {
-    async function initializeSpecs() {
-      if (currentUser) {
-        await init();
-        const specsBuilder = new PubkySpecsBuilder(currentUser.z32());
-        setSpecs(specsBuilder);
-      } else {
-        setSpecs(null);
-      }
+    if (session) {
+      // pubky-app-specs 0.4+ does not require init().
+      setSpecs(new PubkySpecsBuilder(session.info.publicKey.z32()));
+    } else {
+      setSpecs(null);
     }
-    
-    initializeSpecs();
-  }, [currentUser]);
+  }, [session]);
 
-  async function checkSession(publicKey) {
+  async function signIn(keypair) {
     try {
-      const activeSession = await client.session(publicKey);
-      if (activeSession) {
-        setCurrentUser(publicKey);
-        setSession(activeSession);
-      }
-    } catch (error) {
-      console.error('Session check failed:', error);
-    }
-  }
-
-  async function signIn(recoveryFile, passphrase) {
-    try {
-      const keypair = decryptRecoveryFile(recoveryFile, passphrase);
-      await client.signin(keypair);
-      
-      const publicKey = keypair.publicKey();
-      const newSession = await client.session(publicKey);
-      
-      setCurrentUser(publicKey);
-      setSession(newSession);
-      localStorage.setItem('pubky_user', publicKey.z32());
-      
+      const next = await pubky.signer(keypair).signin();
+      localStorage.setItem(SESSION_KEY, next.export());
+      setSession(next);
       return { success: true };
     } catch (error) {
       return { success: false, error: error.message };
@@ -1128,24 +1096,21 @@ export function PubkyProvider({ children }) {
   }
 
   async function signOut() {
-    if (currentUser) {
-      await client.signout(currentUser);
-      setCurrentUser(null);
-      setSession(null);
-      setSpecs(null);
-      localStorage.removeItem('pubky_user');
-    }
+    if (!session) return;
+    await session.signout();
+    localStorage.removeItem(SESSION_KEY);
+    setSession(null);
   }
 
   const value = {
-    client,
-    currentUser,
+    pubky,
     session,
+    currentUser: session?.info.publicKey ?? null,
     specs,
     signIn,
     signOut,
-    isSignedIn: !!currentUser,
-    isReady: !!specs
+    isSignedIn: !!session,
+    isReady: !!specs,
   };
 
   return (
@@ -1170,27 +1135,21 @@ export function usePubky() {
 class Environment {
   static getConfig() {
     const env = process.env.NODE_ENV || 'development';
-    
+
     const configs = {
       development: {
-        client: () => Client.testnet(),
+        pubky: () => Pubky.testnet(),
         homeserver: 'your_testnet_homeserver_key_here',
-        relays: ['http://localhost:15412/link']
+        relay: 'http://localhost:15412/inbox/'
       },
-      
+
       production: {
-        client: () => new Client({
-          pkarr: {
-            relays: ['https://your-pkarr-relay1.example.com/', 'https://your-pkarr-relay2.example.com/'],
-            requestTimeout: 10000
-          },
-          userMaxRecordAge: 3600
-        }),
+        pubky: () => new Pubky(),
         homeserver: 'your_production_homeserver_key_here',
-        relays: ['https://your-http-relay.example.com/link']
+        relay: 'https://httprelay.pubky.app/inbox'
       }
     };
-    
+
     return configs[env] || configs.development;
   }
 }
