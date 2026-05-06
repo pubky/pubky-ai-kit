@@ -772,12 +772,19 @@ await signer.approveAuthRequest(authUrl);
 
 ## Pubky-Nexus API Integration
 
+> The Nexus REST API is on `/v0` and is **explicitly unstable** — breaking
+> changes can land at any time. Treat the endpoint shapes below as
+> illustrative; the Swagger UIs are the source of truth:
+> https://nexus.pubky.app/swagger-ui/ (production) and
+> https://nexus.staging.pubky.app/swagger-ui/ (staging).
+
 ### Base Configuration
 
 ```javascript
-const NEXUS_API_BASE_URL = process.env.NEXT_PUBLIC_NEXUS ? 
-  `${process.env.NEXT_PUBLIC_NEXUS}/v0` : 
-  'https://your-nexus-api.example.com/v0';
+// Synonym-hosted Nexus; set NEXT_PUBLIC_NEXUS to use a different instance.
+const NEXUS_API_BASE_URL = process.env.NEXT_PUBLIC_NEXUS ?
+  `${process.env.NEXT_PUBLIC_NEXUS}/v0` :
+  'https://nexus.pubky.app/v0';
 ```
 
 ### Server Info
@@ -909,32 +916,25 @@ const file = await axios.get(`${NEXUS_API_BASE_URL}/files/file/${fileUriEncoded}
 ## Error Handling Patterns
 
 ```javascript
-// Network errors
+// Network / auth errors — session.storage throws PubkyError on failure
 try {
-  const response = await client.fetch(url);
-  
-  switch (response.status) {
-    case 200:
-      return await response.json();
-    case 404:
-      console.log('Resource not found');
-      return null;
-    case 401:
+  return await session.storage.getJson(path);
+} catch (e) {
+  const error = e; // PubkyError
+  switch (error.name) {
+    case 'RequestError':
+      // Includes 4xx and 5xx server responses, plus malformed input.
+      console.error('Request failed:', error.message);
+      throw error;
+    case 'AuthenticationError':
       console.log('Not authenticated - sign in required');
       throw new Error('AUTHENTICATION_REQUIRED');
-    case 403:
-      console.log('Access forbidden - insufficient permissions');
-      throw new Error('PERMISSION_DENIED');
+    case 'PkarrError':
+      console.error('PKARR resolution failed:', error.message);
+      throw error;
     default:
-      const errorText = await response.text();
-      throw new Error(`HTTP ${response.status}: ${errorText}`);
+      throw error;
   }
-} catch (error) {
-  if (error.name === 'TypeError' && error.message.includes('fetch')) {
-    console.error('Network error:', error);
-    throw new Error('NETWORK_ERROR');
-  }
-  throw error;
 }
 
 // Validation errors
@@ -960,7 +960,7 @@ try {
 5. Pubky-Nexus `nexus-watcher` detects event
 6. `nexus-watcher` updates Neo4j social graph and Redis caches
 7. Other users request feed via Nexus API
-8. `nexus-service` queries Redis/Neo4j and returns feed data
+8. `nexus-webapi` queries Redis/Neo4j and returns feed data
 
 ## Testing Strategies
 
@@ -968,11 +968,10 @@ try {
 
 ```javascript
 import test from 'tape';
-import { Client, Keypair, PublicKey } from '@synonymdev/pubky';
-import init, { PubkySpecsBuilder, PubkyAppPostKind } from 'pubky-app-specs';
+import { Pubky, Keypair, PublicKey } from '@synonymdev/pubky';
+import { PubkySpecsBuilder, PubkyAppPostKind } from 'pubky-app-specs';
 
-test('data model validation', async (t) => {
-  await init();
+test('data model validation', (t) => {
   const pubkyId = 'operrr8wsbpr3ue9d4qj41ge1kcc6r7fdiy6o3ugjrrhi4y77rdo';
   const specs = new PubkySpecsBuilder(pubkyId);
 
@@ -987,66 +986,57 @@ test('data model validation', async (t) => {
   t.ok(postResult.post, 'post created successfully');
   t.equal(postResult.post.content, "Hello world", 'post content correct');
   t.ok(postResult.meta.id.length === 13, 'post ID has correct length');
+  t.end();
 });
 
 test('authentication flow', async (t) => {
-  const client = Client.testnet();
+  const pubky = Pubky.testnet();
   const keypair = Keypair.random();
   const homeserver = PublicKey.from('your_homeserver_public_key_here');
 
-  // Test signup
-  const session = await client.signup(keypair, homeserver, null);
-  t.ok(session, 'signup successful');
-  t.equal(session.pubky().z32(), keypair.publicKey().z32(), 'correct session pubky');
+  const signer = pubky.signer(keypair);
 
-  // Test session check
-  const activeSession = await client.session(keypair.publicKey());
-  t.ok(activeSession, 'session exists after signup');
+  // Test signup
+  const session = await signer.signup(homeserver, null);
+  t.ok(session, 'signup successful');
+  t.equal(session.info.publicKey.z32(), keypair.publicKey().z32(), 'correct session pubky');
 
   // Test signout
-  await client.signout(keypair.publicKey());
-  const noSession = await client.session(keypair.publicKey());
-  t.notOk(noSession, 'no session after signout');
+  await session.signout();
+  t.end();
 });
 
 test('data operations with validation', async (t) => {
-  await init();
-  const client = Client.testnet();
+  const pubky = Pubky.testnet();
   const keypair = Keypair.random();
   const homeserver = PublicKey.from('your_homeserver_public_key_here');
-  
-  await client.signup(keypair, homeserver, null);
-  
+
+  const session = await pubky.signer(keypair).signup(homeserver, null);
+
   const pubkyId = keypair.publicKey().z32();
   const specs = new PubkySpecsBuilder(pubkyId);
-  
+
   // Create and store validated post
   const postResult = specs.createPost("Test content", PubkyAppPostKind.Short, null, null, null);
-  
-  // Test PUT
-  const putResponse = await client.fetch(postResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(postResult.post.toJson()),
-    credentials: 'include'
-  });
-  t.equal(putResponse.status, 200, 'PUT successful');
 
-  // Test GET
-  const getResponse = await client.fetch(postResult.meta.url);
-  t.equal(getResponse.status, 200, 'GET successful');
-  const retrieved = await getResponse.json();
+  // PUT
+  await session.storage.putJson(postResult.meta.path, postResult.post.toJson());
+
+  // GET
+  const retrieved = await session.storage.getJson(postResult.meta.path);
   t.equal(retrieved.content, "Test content", 'content matches');
 
-  // Test DELETE
-  const deleteResponse = await client.fetch(postResult.meta.url, {
-    method: 'DELETE',
-    credentials: 'include'
-  });
-  t.equal(deleteResponse.status, 200, 'DELETE successful');
+  // DELETE
+  await session.storage.delete(postResult.meta.path);
 
-  // Test GET after delete
-  const notFoundResponse = await client.fetch(postResult.meta.url);
-  t.equal(notFoundResponse.status, 404, 'resource not found after delete');
+  // Confirm gone — getJson throws on 404
+  try {
+    await session.storage.getJson(postResult.meta.path);
+    t.fail('expected getJson to throw after delete');
+  } catch {
+    t.pass('resource not found after delete');
+  }
+  t.end();
 });
 ```
 
@@ -1179,7 +1169,6 @@ class Environment {
 
 ### What to Remember
 - All data operations require proper authentication via sessions
-- Only `/pub/` directories are publicly readable
 - Write operations require appropriate capabilities
 - Homeserver records should be republished periodically
 - Use testnet for development, mainnet for production
