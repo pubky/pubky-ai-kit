@@ -78,22 +78,17 @@ Uses AuthTokens - signed timestamps with capabilities that prove ownership of a 
 ```bash
 # Install the data model specs package
 npm install pubky-app-specs
-
-# Note: This package uses WASM, ensure your bundler supports WASM modules
 ```
 
 ### Core Usage Pattern
 
 ```javascript
-import init, { PubkySpecsBuilder } from "pubky-app-specs";
+import { PubkySpecsBuilder } from "pubky-app-specs";
 
-async function initializePubkySpecs(pubkyId) {
-  // 1. Initialize WASM module
-  await init();
-  
-  // 2. Create specs builder with user's public key
+function initializePubkySpecs(pubkyId) {
+  // Create specs builder with user's public key.
   const specs = new PubkySpecsBuilder(pubkyId);
-  
+
   return specs;
 }
 ```
@@ -239,14 +234,12 @@ console.log("Blob ID:", meta.id);           // Hash-based ID from content
 
 #### PubkyAppFeed (Custom Perspectives)
 ```javascript
-import { PubkyAppFeedReach, PubkyAppFeedLayout, PubkyAppFeedSort } from "pubky-app-specs";
-
 const feedResult = specs.createFeed(
   ["bitcoin", "rust"],                       // tags filter
-  PubkyAppFeedReach.Following,               // reach: Following, Followers, Friends, All
-  PubkyAppFeedLayout.Columns,                // layout: Columns, Wide, Visual  
-  PubkyAppFeedSort.Recent,                   // sort: Recent, Popularity
-  PubkyAppPostKind.Image,                    // content filter (optional)
+  "following",                               // reach: "following" | "followers" | "friends" | "all"
+  "columns",                                 // layout: "columns" | "wide" | "visual"
+  "recent",                                  // sort: "recent" | "popularity"
+  "image",                                   // content filter (optional): "short" | "long" | "image" | "video" | "link" | "file"
   "Bitcoin Developers"                       // feed name
 );
 ```
@@ -1287,7 +1280,6 @@ class Environment {
 - Use testnet for development, mainnet for production
 - Error handling is crucial for network resilience
 - Recovery files are encrypted with user passphrases
-- Always initialize WASM module before using pubky-app-specs
 - Data models are automatically validated and sanitized
 - IDs and paths are generated following strict conventions
 
@@ -1297,7 +1289,6 @@ class Environment {
 - Homeserver endpoints must be resolved via Pkarr network
 - Sessions contain capabilities that determine permissions
 - Z-base-32 encoding is used for public key representations
-- pubky-app-specs requires WASM initialization before use
 - Validation errors provide specific messages about what's wrong
 - All data models follow the `/pub/pubky.app/` path convention
 
