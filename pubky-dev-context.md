@@ -16,7 +16,7 @@ Pubky is an open protocol for per-public-key backends enabling censorship-resist
 
 **Pubky App Specs** - Data model validation and creation
 - NPM package: `pubky-app-specs`
-- Version: 0.3.4
+- Version: 0.4.x
 - WASM-based validation and ID generation
 - Provides structured JSON models for social media features
 
@@ -35,21 +35,33 @@ Pubky is an open protocol for per-public-key backends enabling censorship-resist
 
 **Pubky-Nexus** - Backend aggregation service
 - Aggregates, indexes, and caches data from multiple Homeservers
-- Provides higher-level REST API for social applications
-- Components: nexus-watcher, nexus-service, nexusd
+- Provides higher-level REST API for social applications (Nexus is in active development; API still on /v0 with breaking changes possible)
+- Components: nexus-watcher, nexus-webapi, nexus-common, nexusd
 - Databases: Neo4j (social graph), Redis (caching)
 
 ### URL Structure
 ```
-pubky://<public_key>/pub/<domain>/<path>
+pubky://<public_key>/pub/<path>
 ```
 - `public_key`: z-base-32 encoded public key (52 characters)
-- `pub/`: indicates public data
-- `domain`: provides scoping (default: "pubky.app")
-- `path`: specifies the resource
+- `/pub`: the only protocol-required top-level directory; everything after is app-chosen.
+
+Only `/pub` is formalized today. The protocol leaves room for other top-level roots alongside it (`/priv` for private/encrypted data is the long-standing placeholder), but none have been formalized yet — more may follow.
+
+By convention the first segment under `/pub` is a **scope**, and an app may touch several. Real-world examples:
+
+- **[Mapky](https://mapky.app)** writes its own data under `/pub/mapky.app/*` and uses `/pub/pubky.app/*` to reuse the user's profile and otherwise interop with pubky.app where it benefits either app.
+- **Bitkit** writes app-specific state under `/pub/bitkit.to/*` and uses `/pub/paykit/*` for the Paykit protocol — a cross-app scope shared between Paykit-implementing apps.
+
+Common scope flavors:
+
+- **app-domain** (`pubky.app`, `mapky.app`, `bitkit.to`) — an app's own data
+- **protocol** (`paykit`) — a shared standard
 
 ### Authentication Model
-Uses AuthTokens - signed timestamps with capabilities that prove ownership of a public key and grant specific permissions.
+Uses AuthTokens - signed timestamps with capabilities that prove ownership of a public key and grant specific permissions. Tokens are valid for a 3-minute window to account for clock drift.
+
+> **Known limitation**: All sessions currently share a single authentication cookie ([pubky-core#122](https://github.com/pubky/pubky-core/issues/122)) - signing into App B overwrites App A's session. A rework is in progress, building on a JWT-based solution.
 
 ### Core Principles
 
