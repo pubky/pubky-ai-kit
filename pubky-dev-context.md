@@ -286,38 +286,29 @@ const restoredUser = PubkyAppUser.fromJson(parsedJson);
 ### Complete Social Media Post Creation
 
 ```javascript
-import { Client, Keypair } from "@synonymdev/pubky";
-import init, { PubkySpecsBuilder, PubkyAppPostKind } from "pubky-app-specs";
+import { Pubky, Keypair } from "@synonymdev/pubky";
+import { PubkySpecsBuilder, PubkyAppPostKind } from "pubky-app-specs";
 
 async function createAndStorePost(keypair, content) {
   // Initialize
-  const client = Client.testnet();
-  await init();
-  
+  const pubky = Pubky.testnet();
+
   const pubkyId = keypair.publicKey().z32();
   const specs = new PubkySpecsBuilder(pubkyId);
-  
+
   // Ensure authenticated
-  await client.signin(keypair);
-  
+  const session = await pubky.signer(keypair).signin();
+
   // Create validated post
   const postResult = specs.createPost(
     content,
     PubkyAppPostKind.Short,
     null, null, null
   );
-  
+
   // Store on homeserver
-  const response = await client.fetch(postResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(postResult.post.toJson()),
-    credentials: 'include'
-  });
-  
-  if (!response.ok) {
-    throw new Error(`Failed to store post: ${response.statusText}`);
-  }
-  
+  await session.storage.putJson(postResult.meta.path, postResult.post.toJson());
+
   console.log("Post stored at:", postResult.meta.url);
   return postResult;
 }
@@ -326,7 +317,7 @@ async function createAndStorePost(keypair, content) {
 ### Profile Management
 
 ```javascript
-async function updateProfile(client, specs, profileData) {
+async function updateProfile(session, specs, profileData) {
   const userResult = specs.createUser(
     profileData.name,
     profileData.bio,
@@ -334,71 +325,52 @@ async function updateProfile(client, specs, profileData) {
     profileData.links,
     profileData.status
   );
-  
-  // Store profile
-  await client.fetch(userResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(userResult.user.toJson()),
-    credentials: 'include'
-  });
-  
+
+  // Store profile (own data → session.storage)
+  await session.storage.putJson(userResult.meta.path, userResult.user.toJson());
+
   return userResult;
 }
 
-async function getProfile(client, pubkyId) {
+async function getProfile(pubky, pubkyId) {
+  // Reading another user's public data → pubky.publicStorage
   const url = `pubky://${pubkyId}/pub/pubky.app/profile.json`;
-  const response = await client.fetch(url);
-  
-  if (response.status === 404) {
-    return null; // No profile found
+  try {
+    return await pubky.publicStorage.getJson(url);
+  } catch (e) {
+    const error = e; // PubkyError
+    if (error.message.includes("404")) return null; // No profile found
+    throw e;
   }
-  
-  if (!response.ok) {
-    throw new Error(`Failed to fetch profile: ${response.status}`);
-  }
-  
-  return await response.json();
 }
 ```
 
 ### Social Interactions
 
 ```javascript
-async function followUser(client, specs, targetUserId) {
+async function followUser(session, specs, targetUserId) {
   const followResult = specs.createFollow(targetUserId);
-  
-  await client.fetch(followResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(followResult.follow.toJson()),
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putJson(followResult.meta.path, followResult.follow.toJson());
+
   console.log(`Following user: ${targetUserId}`);
   return followResult;
 }
 
-async function tagPost(client, specs, postUri, label) {
+async function tagPost(session, specs, postUri, label) {
   const tagResult = specs.createTag(postUri, label);
-  
-  await client.fetch(tagResult.meta.url, {
-    method: 'PUT', 
-    body: JSON.stringify(tagResult.tag.toJson()),
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putJson(tagResult.meta.path, tagResult.tag.toJson());
+
   console.log(`Tagged ${postUri} with "${label}"`);
   return tagResult;
 }
 
-async function bookmarkPost(client, specs, postUri) {
+async function bookmarkPost(session, specs, postUri) {
   const bookmarkResult = specs.createBookmark(postUri);
-  
-  await client.fetch(bookmarkResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(bookmarkResult.bookmark.toJson()),
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putJson(bookmarkResult.meta.path, bookmarkResult.bookmark.toJson());
+
   return bookmarkResult;
 }
 ```
@@ -477,10 +449,10 @@ try {
 }
 ```
 
-### WASM Initialization Errors
+### Invalid Public Key Errors
 ```javascript
 try {
-  await init();
+  // pubky-app-specs 0.4+: no init() needed, builder constructor validates the id.
   const specs = new PubkySpecsBuilder("invalid_pubky_id");
 } catch (error) {
   console.error("Invalid public key:", error.message);
@@ -489,28 +461,20 @@ try {
 
 ### Network Errors with Validation
 ```javascript
-async function safeCreatePost(client, specs, content) {
+async function safeCreatePost(session, specs, content) {
   try {
     // Validation happens here
     const postResult = specs.createPost(content, PubkyAppPostKind.Short);
-    
-    // Network operation
-    const response = await client.fetch(postResult.meta.url, {
-      method: 'PUT',
-      body: JSON.stringify(postResult.post.toJson()),
-      credentials: 'include'
-    });
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-    }
-    
+
+    // Network operation — throws PubkyError on failure
+    await session.storage.putJson(postResult.meta.path, postResult.post.toJson());
+
     return postResult;
-    
+
   } catch (error) {
     if (error.message.includes('Validation Error')) {
       console.error('Content validation failed:', error.message);
-    } else if (error.message.includes('HTTP')) {
+    } else if (error.name === 'RequestError') {
       console.error('Network error:', error.message);
     } else {
       console.error('Unexpected error:', error.message);
@@ -524,65 +488,51 @@ async function safeCreatePost(client, specs, content) {
 
 ### Bulk Data Operations
 ```javascript
-async function createBulkPosts(client, specs, posts) {
+async function createBulkPosts(session, specs, posts) {
   const results = [];
-  
+
   for (const postContent of posts) {
     try {
       const postResult = specs.createPost(postContent, PubkyAppPostKind.Short);
-      
-      await client.fetch(postResult.meta.url, {
-        method: 'PUT',
-        body: JSON.stringify(postResult.post.toJson()),
-        credentials: 'include'
-      });
-      
+
+      await session.storage.putJson(postResult.meta.path, postResult.post.toJson());
+
       results.push({ success: true, post: postResult });
     } catch (error) {
       results.push({ success: false, error: error.message, content: postContent });
     }
   }
-  
+
   return results;
 }
 ```
 
 ### Custom Feed Management
 ```javascript
-import { PubkyAppFeedReach, PubkyAppFeedLayout, PubkyAppFeedSort } from "pubky-app-specs";
-
-async function saveCustomFeed(client, specs, feedConfig) {
+async function saveCustomFeed(session, specs, feedConfig) {
   const feedResult = specs.createFeed(
     feedConfig.tags,
-    PubkyAppFeedReach[feedConfig.reach],
-    PubkyAppFeedLayout[feedConfig.layout], 
-    PubkyAppFeedSort[feedConfig.sort],
-    feedConfig.contentType ? PubkyAppPostKind[feedConfig.contentType] : null,
+    feedConfig.reach,         // "following" | "followers" | "friends" | "all"
+    feedConfig.layout,        // "columns" | "wide" | "visual"
+    feedConfig.sort,          // "recent" | "popularity"
+    feedConfig.contentType ?? null,  // (optional) "short" | "long" | "image" | "video" | "link" | "file"
     feedConfig.name
   );
-  
-  await client.fetch(feedResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(feedResult.feed.toJson()),
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putJson(feedResult.meta.path, feedResult.feed.toJson());
+
   return feedResult;
 }
 ```
 
 ### File Upload with Metadata
 ```javascript
-async function uploadFileWithMetadata(client, specs, fileData, metadata) {
+async function uploadFileWithMetadata(session, specs, fileData, metadata) {
   // First, create and store the blob
   const blobResult = specs.createBlob(fileData);
-  
-  await client.fetch(blobResult.meta.url, {
-    method: 'PUT',
-    body: blobResult.blob.data, // Access raw Uint8Array
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putBytes(blobResult.meta.path, blobResult.blob.data);
+
   // Then create file metadata pointing to the blob
   const fileResult = specs.createFile(
     metadata.name,
@@ -590,13 +540,9 @@ async function uploadFileWithMetadata(client, specs, fileData, metadata) {
     metadata.contentType,
     fileData.length
   );
-  
-  await client.fetch(fileResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(fileResult.file.toJson()),
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putJson(fileResult.meta.path, fileResult.file.toJson());
+
   return { blob: blobResult, file: fileResult };
 }
 ```
