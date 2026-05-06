@@ -708,22 +708,22 @@ cargo add pubky anyhow tokio
 ### Client Initialization
 
 ```javascript
-import { Client, Keypair, PublicKey } from "@synonymdev/pubky";
+import { Pubky, Keypair, PublicKey, Client } from "@synonymdev/pubky";
 
 // Default client (mainnet)
-const client = new Client();
+const pubky = new Pubky();
 
 // Testnet client for development
-const client = Client.testnet();
+const pubkyTestnet = Pubky.testnet();
 
 // Custom configuration
 const client = new Client({
   pkarr: {
     relays: ['https://your-pkarr-relay.example.com/'],
     requestTimeout: 2000
-  },
-  userMaxRecordAge: 3600
+  }
 });
+const pubkyCustom = Pubky.withClient(client);
 ```
 
 ### Authentication Flows
@@ -733,129 +733,113 @@ const client = new Client({
 const homeserver = PublicKey.from('your_homeserver_public_key_here');
 const signupToken = 'optional_invite_code';
 
+const signer = pubky.signer(keypair);
+
 try {
-  const session = await client.signup(keypair, homeserver, signupToken);
-  console.log('Signed up:', session.pubky().z32());
-  console.log('Capabilities:', session.capabilities());
+  const session = await signer.signup(homeserver, signupToken);
+  console.log('Signed up:', session.info.publicKey.toString());
+  console.log('Capabilities:', session.info.capabilities);
 } catch (error) {
   console.error('Signup failed:', error);
 }
 
-// Check session status
-const session = await client.session(publicKey);
-if (session) {
-  console.log('Active session with capabilities:', session.capabilities());
-} else {
-  console.log('Not signed in');
-}
-
 // Sign in existing user
-await client.signin(keypair);
+const session = await signer.signin();
 
 // Sign out
-await client.signout(publicKey);
+await session.signout();
 
 // Get user's homeserver
 try {
-  const homeserverKey = await client.getHomeserver(publicKey);
+  const homeserverKey = await pubky.getHomeserverOf(publicKey);
   console.log('Homeserver:', homeserverKey.z32());
 } catch (error) {
   console.log('No homeserver found');
 }
 
 // Republish homeserver record (for key managers)
-await client.republishHomeserver(keypair, homeserverPublicKey);
+await signer.pkdns.publishHomeserverIfStale(homeserverPublicKey);
 ```
 
 ### Data Operations
 
 ```javascript
-const userPubky = publicKey.z32();
+// All session-scoped storage uses the user's own /pub paths.
+const path = '/pub/example.com/todos.json';
+const data = [
+  { text: 'Buy milk', done: false },
+  { text: 'Walk the dog', done: true },
+];
 
-// PUT data
-const url = `pubky://${userPubky}/pub/example.com/profile.json`;
-const data = { name: 'Alice', bio: 'Developer' };
+// PUT JSON
+await session.storage.putJson(path, data);
 
-await client.fetch(url, {
-  method: 'PUT',
-  body: JSON.stringify(data),
-  credentials: 'include'
-});
+// GET JSON
+const todos = await session.storage.getJson(path);
+console.log('Todos:', todos);
 
-// GET data
-const response = await client.fetch(url);
-if (response.status === 200) {
-  const profile = await response.json();
-  console.log('Profile:', profile);
-}
+// DELETE
+await session.storage.delete(path);
 
-// DELETE data
-await client.fetch(url, {
-  method: 'DELETE',
-  credentials: 'include'
-});
-
-// PUT binary data
-const imageData = new Uint8Array([/* image bytes */]);
-await client.fetch(`pubky://${userPubky}/pub/images/avatar.png`, {
-  method: 'PUT',
-  body: imageData,
-  credentials: 'include'
-});
+// PUT binary data — e.g. an attachment for a todo
+const photoBytes = new Uint8Array([/* image bytes */]);
+await session.storage.putBytes('/pub/example.com/attachments/todo-1.png', photoBytes);
 ```
 
 ### Directory Listing
 
 ```javascript
-// List directory contents
-const dirUrl = `pubky://${userPubky}/pub/example.com/`;
+// List directory contents (path must end with `/`)
+const dirPath = '/pub/example.com/';
 
 // Basic listing
-const files = await client.list(dirUrl);
+const files = await session.storage.list(dirPath);
 
-// With options: list(url, cursor, reverse, limit, shallow)
-const files = await client.list(dirUrl, null, false, 10, false);
+// With options: list(path, cursor, reverse, limit, shallow)
+const firstTen = await session.storage.list(dirPath, null, false, 10, false);
 
 // Paginated listing
 let cursor = null;
 const allFiles = [];
+let batch;
 do {
-  const batch = await client.list(dirUrl, cursor, false, 50);
+  batch = await session.storage.list(dirPath, cursor, false, 50);
   allFiles.push(...batch);
   cursor = batch.length > 0 ? batch[batch.length - 1] : null;
 } while (cursor && batch.length === 50);
 
 // Shallow listing (directories and files, not flat)
-const directories = await client.list(dirUrl, null, false, null, true);
+const directories = await session.storage.list(dirPath, null, false, null, true);
 ```
 
 ### Third-Party Authorization
 
 ```javascript
+import { AuthFlowKind } from "@synonymdev/pubky";
+
 // App requests authorization
-const relay = "https://your-relay-service.example.com/link";
+// Synonym-hosted HTTP relay; pass your own URL to use a different one.
+// Base relay URL; the SDK appends the channel id internally.
+const relay = "https://httprelay.pubky.app/inbox";
 const capabilities = "/pub/myapp.com/:rw,/pub/shared/:r";
 
-const authRequest = client.authRequest(relay, capabilities);
-const authUrl = authRequest.url();
+const flow = pubky.startAuthFlow(capabilities, AuthFlowKind.signin(), relay);
+const authUrl = flow.authorizationUrl; // property, not method
 
 // Show QR code or redirect user to authUrl
 console.log('Visit:', authUrl);
 
 // Wait for user authorization
 try {
-  const authorizedPubky = await authRequest.response();
-  console.log('Authorized by:', authorizedPubky.z32());
-  
-  // Check session capabilities
-  const session = await client.session(authorizedPubky);
-  console.log('Granted capabilities:', session.capabilities());
+  const session = await flow.awaitApproval();
+  console.log('Authorized by:', session.info.publicKey.toString());
+  console.log('Granted capabilities:', session.info.capabilities);
 } catch (error) {
   console.error('Authorization failed:', error);
 }
 
-// User authorizes the request (in authenticator app)
-await client.sendAuthToken(keypair, authUrl);
+// User authorizes the request (in authenticator app, e.g. Pubky Ring)
+await signer.approveAuthRequest(authUrl);
 ```
 
 ## Pubky-Nexus API Integration
