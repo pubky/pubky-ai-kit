@@ -23,10 +23,10 @@ Pubky is an open protocol for per-public-key backends enabling censorship-resist
 **Homeserver** - User's personal backend
 - Provides storage and HTTP endpoints
 - Validates authentication tokens and manages user data
-- Key-value store accessed via HTTP methods (PUT, GET, DELETE)
+- App-facing API is **file storage only**: HTTP `PUT` / `GET` / `DELETE` against `pubky://<pk>/pub/...` paths. Each entry is an opaque byte blob with a MIME type — typically JSON (e.g. `pubky-app-specs` post/profile records) but equally images, audio, video, PDFs, encrypted ciphertext, or any other format the app chooses. No protocol-level restriction on content type.
 - Supports both public and private data (current implementations focus on public data)
 - Can be operated by individuals, cooperatives, or commercial entities
-- Persistence backends: Files, LMDB, or SQL (PostgreSQL)
+- Internally the homeserver uses **PostgreSQL** for its own metadata — users (Ed25519 pubkey + quota), sessions (capability-scoped auth), entries (per-file path, blake3 hash, length, MIME, timestamps), events (PUT/DEL stream consumed by Nexus and other subscribers), and signup codes. **Applications never connect to PostgreSQL directly** — they only see the file API.
 - Default per-request payload limit: **10 MB** (returns `413` past that). This is independent of per-user quotas, which are operator-defined — for reference, Synonym's public homeserver enforces 1 GB per user with a 10 MB per file ceiling.
 
 **Pkarr Network** - Distributed DNS alternative
