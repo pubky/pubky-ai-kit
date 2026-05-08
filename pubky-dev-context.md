@@ -16,16 +16,18 @@ Pubky is an open protocol for per-public-key backends enabling censorship-resist
 
 **Pubky App Specs** - Data model validation and creation
 - NPM package: `pubky-app-specs`
-- Version: 0.3.4
+- Version: 0.4.x
 - WASM-based validation and ID generation
 - Provides structured JSON models for social media features
 
 **Homeserver** - User's personal backend
 - Provides storage and HTTP endpoints
 - Validates authentication tokens and manages user data
-- Key-value store accessed via HTTP methods (PUT, GET, DELETE)
+- App-facing API is **file storage only**: HTTP `PUT` / `GET` / `DELETE` against `pubky://<pk>/pub/...` paths. Each entry is an opaque byte blob with a MIME type — typically JSON (e.g. `pubky-app-specs` post/profile records) but equally images, audio, video, PDFs, encrypted ciphertext, or any other format the app chooses. No protocol-level restriction on content type.
 - Supports both public and private data (current implementations focus on public data)
 - Can be operated by individuals, cooperatives, or commercial entities
+- Internally the homeserver uses **PostgreSQL** for its own metadata — users (Ed25519 pubkey + quota), sessions (capability-scoped auth), entries (per-file path, blake3 hash, length, MIME, timestamps), events (PUT/DEL stream consumed by Nexus and other subscribers), and signup codes. **Applications never connect to PostgreSQL directly** — they only see the file API.
+- Default per-request payload limit: **10 MB** (returns `413` past that). This is independent of per-user quotas, which are operator-defined — for reference, Synonym's public homeserver enforces 1 GB per user with a 10 MB per file ceiling.
 
 **Pkarr Network** - Distributed DNS alternative
 - Uses public keys as domains via Mainline DHT
@@ -35,21 +37,33 @@ Pubky is an open protocol for per-public-key backends enabling censorship-resist
 
 **Pubky-Nexus** - Backend aggregation service
 - Aggregates, indexes, and caches data from multiple Homeservers
-- Provides higher-level REST API for social applications
-- Components: nexus-watcher, nexus-service, nexusd
+- Provides higher-level REST API for social applications (Nexus is in active development; API still on /v0 with breaking changes possible)
+- Components: nexus-watcher, nexus-webapi, nexus-common, nexusd
 - Databases: Neo4j (social graph), Redis (caching)
 
 ### URL Structure
 ```
-pubky://<public_key>/pub/<domain>/<path>
+pubky://<public_key>/pub/<path>
 ```
 - `public_key`: z-base-32 encoded public key (52 characters)
-- `pub/`: indicates public data
-- `domain`: provides scoping (default: "pubky.app")
-- `path`: specifies the resource
+- `/pub`: the only protocol-required top-level directory; everything after is app-chosen.
+
+Only `/pub` is formalized today. The protocol leaves room for other top-level roots alongside it (`/priv` for private/encrypted data is the long-standing placeholder), but none have been formalized yet — more may follow.
+
+By convention the first segment under `/pub` is a **scope**, and an app may touch several. Real-world examples:
+
+- **[Mapky](https://mapky.app)** writes its own data under `/pub/mapky.app/*` and uses `/pub/pubky.app/*` to reuse the user's profile and otherwise interop with pubky.app where it benefits either app.
+- **Bitkit** writes app-specific state under `/pub/bitkit.to/*` and uses `/pub/paykit/*` for the Paykit protocol — a cross-app scope shared between Paykit-implementing apps.
+
+Common scope flavors:
+
+- **app-domain** (`pubky.app`, `mapky.app`, `bitkit.to`) — an app's own data
+- **protocol** (`paykit`) — a shared standard
 
 ### Authentication Model
-Uses AuthTokens - signed timestamps with capabilities that prove ownership of a public key and grant specific permissions.
+Uses AuthTokens - signed timestamps with capabilities that prove ownership of a public key and grant specific permissions. Tokens are valid for a 3-minute window to account for clock drift.
+
+> **Known limitation**: All sessions currently share a single authentication cookie ([pubky-core#122](https://github.com/pubky/pubky-core/issues/122)) - signing into App B overwrites App A's session. A rework is in progress, building on a JWT-based solution.
 
 ### Core Principles
 
@@ -66,22 +80,17 @@ Uses AuthTokens - signed timestamps with capabilities that prove ownership of a 
 ```bash
 # Install the data model specs package
 npm install pubky-app-specs
-
-# Note: This package uses WASM, ensure your bundler supports WASM modules
 ```
 
 ### Core Usage Pattern
 
 ```javascript
-import init, { PubkySpecsBuilder } from "pubky-app-specs";
+import { PubkySpecsBuilder } from "pubky-app-specs";
 
-async function initializePubkySpecs(pubkyId) {
-  // 1. Initialize WASM module
-  await init();
-  
-  // 2. Create specs builder with user's public key
+function initializePubkySpecs(pubkyId) {
+  // Create specs builder with user's public key.
   const specs = new PubkySpecsBuilder(pubkyId);
-  
+
   return specs;
 }
 ```
@@ -227,14 +236,12 @@ console.log("Blob ID:", meta.id);           // Hash-based ID from content
 
 #### PubkyAppFeed (Custom Perspectives)
 ```javascript
-import { PubkyAppFeedReach, PubkyAppFeedLayout, PubkyAppFeedSort } from "pubky-app-specs";
-
 const feedResult = specs.createFeed(
   ["bitcoin", "rust"],                       // tags filter
-  PubkyAppFeedReach.Following,               // reach: Following, Followers, Friends, All
-  PubkyAppFeedLayout.Columns,                // layout: Columns, Wide, Visual  
-  PubkyAppFeedSort.Recent,                   // sort: Recent, Popularity
-  PubkyAppPostKind.Image,                    // content filter (optional)
+  "following",                               // reach: "following" | "followers" | "friends" | "all"
+  "columns",                                 // layout: "columns" | "wide" | "visual"
+  "recent",                                  // sort: "recent" | "popularity"
+  "image",                                   // content filter (optional): "short" | "long" | "image" | "video" | "link" | "file"
   "Bitcoin Developers"                       // feed name
 );
 ```
@@ -281,38 +288,29 @@ const restoredUser = PubkyAppUser.fromJson(parsedJson);
 ### Complete Social Media Post Creation
 
 ```javascript
-import { Client, Keypair } from "@synonymdev/pubky";
-import init, { PubkySpecsBuilder, PubkyAppPostKind } from "pubky-app-specs";
+import { Pubky, Keypair } from "@synonymdev/pubky";
+import { PubkySpecsBuilder, PubkyAppPostKind } from "pubky-app-specs";
 
 async function createAndStorePost(keypair, content) {
   // Initialize
-  const client = Client.testnet();
-  await init();
-  
+  const pubky = Pubky.testnet();
+
   const pubkyId = keypair.publicKey().z32();
   const specs = new PubkySpecsBuilder(pubkyId);
-  
+
   // Ensure authenticated
-  await client.signin(keypair);
-  
+  const session = await pubky.signer(keypair).signin();
+
   // Create validated post
   const postResult = specs.createPost(
     content,
     PubkyAppPostKind.Short,
     null, null, null
   );
-  
+
   // Store on homeserver
-  const response = await client.fetch(postResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(postResult.post.toJson()),
-    credentials: 'include'
-  });
-  
-  if (!response.ok) {
-    throw new Error(`Failed to store post: ${response.statusText}`);
-  }
-  
+  await session.storage.putJson(postResult.meta.path, postResult.post.toJson());
+
   console.log("Post stored at:", postResult.meta.url);
   return postResult;
 }
@@ -321,7 +319,7 @@ async function createAndStorePost(keypair, content) {
 ### Profile Management
 
 ```javascript
-async function updateProfile(client, specs, profileData) {
+async function updateProfile(session, specs, profileData) {
   const userResult = specs.createUser(
     profileData.name,
     profileData.bio,
@@ -329,71 +327,52 @@ async function updateProfile(client, specs, profileData) {
     profileData.links,
     profileData.status
   );
-  
-  // Store profile
-  await client.fetch(userResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(userResult.user.toJson()),
-    credentials: 'include'
-  });
-  
+
+  // Store profile (own data → session.storage)
+  await session.storage.putJson(userResult.meta.path, userResult.user.toJson());
+
   return userResult;
 }
 
-async function getProfile(client, pubkyId) {
+async function getProfile(pubky, pubkyId) {
+  // Reading another user's public data → pubky.publicStorage
   const url = `pubky://${pubkyId}/pub/pubky.app/profile.json`;
-  const response = await client.fetch(url);
-  
-  if (response.status === 404) {
-    return null; // No profile found
+  try {
+    return await pubky.publicStorage.getJson(url);
+  } catch (e) {
+    const error = e; // PubkyError
+    if (error.message.includes("404")) return null; // No profile found
+    throw e;
   }
-  
-  if (!response.ok) {
-    throw new Error(`Failed to fetch profile: ${response.status}`);
-  }
-  
-  return await response.json();
 }
 ```
 
 ### Social Interactions
 
 ```javascript
-async function followUser(client, specs, targetUserId) {
+async function followUser(session, specs, targetUserId) {
   const followResult = specs.createFollow(targetUserId);
-  
-  await client.fetch(followResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(followResult.follow.toJson()),
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putJson(followResult.meta.path, followResult.follow.toJson());
+
   console.log(`Following user: ${targetUserId}`);
   return followResult;
 }
 
-async function tagPost(client, specs, postUri, label) {
+async function tagPost(session, specs, postUri, label) {
   const tagResult = specs.createTag(postUri, label);
-  
-  await client.fetch(tagResult.meta.url, {
-    method: 'PUT', 
-    body: JSON.stringify(tagResult.tag.toJson()),
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putJson(tagResult.meta.path, tagResult.tag.toJson());
+
   console.log(`Tagged ${postUri} with "${label}"`);
   return tagResult;
 }
 
-async function bookmarkPost(client, specs, postUri) {
+async function bookmarkPost(session, specs, postUri) {
   const bookmarkResult = specs.createBookmark(postUri);
-  
-  await client.fetch(bookmarkResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(bookmarkResult.bookmark.toJson()),
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putJson(bookmarkResult.meta.path, bookmarkResult.bookmark.toJson());
+
   return bookmarkResult;
 }
 ```
@@ -472,10 +451,9 @@ try {
 }
 ```
 
-### WASM Initialization Errors
+### Invalid Public Key Errors
 ```javascript
 try {
-  await init();
   const specs = new PubkySpecsBuilder("invalid_pubky_id");
 } catch (error) {
   console.error("Invalid public key:", error.message);
@@ -484,28 +462,20 @@ try {
 
 ### Network Errors with Validation
 ```javascript
-async function safeCreatePost(client, specs, content) {
+async function safeCreatePost(session, specs, content) {
   try {
     // Validation happens here
     const postResult = specs.createPost(content, PubkyAppPostKind.Short);
-    
-    // Network operation
-    const response = await client.fetch(postResult.meta.url, {
-      method: 'PUT',
-      body: JSON.stringify(postResult.post.toJson()),
-      credentials: 'include'
-    });
-    
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-    }
-    
+
+    // Network operation — throws PubkyError on failure
+    await session.storage.putJson(postResult.meta.path, postResult.post.toJson());
+
     return postResult;
-    
+
   } catch (error) {
     if (error.message.includes('Validation Error')) {
       console.error('Content validation failed:', error.message);
-    } else if (error.message.includes('HTTP')) {
+    } else if (error.name === 'RequestError') {
       console.error('Network error:', error.message);
     } else {
       console.error('Unexpected error:', error.message);
@@ -519,65 +489,51 @@ async function safeCreatePost(client, specs, content) {
 
 ### Bulk Data Operations
 ```javascript
-async function createBulkPosts(client, specs, posts) {
+async function createBulkPosts(session, specs, posts) {
   const results = [];
-  
+
   for (const postContent of posts) {
     try {
       const postResult = specs.createPost(postContent, PubkyAppPostKind.Short);
-      
-      await client.fetch(postResult.meta.url, {
-        method: 'PUT',
-        body: JSON.stringify(postResult.post.toJson()),
-        credentials: 'include'
-      });
-      
+
+      await session.storage.putJson(postResult.meta.path, postResult.post.toJson());
+
       results.push({ success: true, post: postResult });
     } catch (error) {
       results.push({ success: false, error: error.message, content: postContent });
     }
   }
-  
+
   return results;
 }
 ```
 
 ### Custom Feed Management
 ```javascript
-import { PubkyAppFeedReach, PubkyAppFeedLayout, PubkyAppFeedSort } from "pubky-app-specs";
-
-async function saveCustomFeed(client, specs, feedConfig) {
+async function saveCustomFeed(session, specs, feedConfig) {
   const feedResult = specs.createFeed(
     feedConfig.tags,
-    PubkyAppFeedReach[feedConfig.reach],
-    PubkyAppFeedLayout[feedConfig.layout], 
-    PubkyAppFeedSort[feedConfig.sort],
-    feedConfig.contentType ? PubkyAppPostKind[feedConfig.contentType] : null,
+    feedConfig.reach,         // "following" | "followers" | "friends" | "all"
+    feedConfig.layout,        // "columns" | "wide" | "visual"
+    feedConfig.sort,          // "recent" | "popularity"
+    feedConfig.contentType ?? null,  // (optional) "short" | "long" | "image" | "video" | "link" | "file"
     feedConfig.name
   );
-  
-  await client.fetch(feedResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(feedResult.feed.toJson()),
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putJson(feedResult.meta.path, feedResult.feed.toJson());
+
   return feedResult;
 }
 ```
 
 ### File Upload with Metadata
 ```javascript
-async function uploadFileWithMetadata(client, specs, fileData, metadata) {
+async function uploadFileWithMetadata(session, specs, fileData, metadata) {
   // First, create and store the blob
   const blobResult = specs.createBlob(fileData);
-  
-  await client.fetch(blobResult.meta.url, {
-    method: 'PUT',
-    body: blobResult.blob.data, // Access raw Uint8Array
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putBytes(blobResult.meta.path, blobResult.blob.data);
+
   // Then create file metadata pointing to the blob
   const fileResult = specs.createFile(
     metadata.name,
@@ -585,13 +541,9 @@ async function uploadFileWithMetadata(client, specs, fileData, metadata) {
     metadata.contentType,
     fileData.length
   );
-  
-  await client.fetch(fileResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(fileResult.file.toJson()),
-    credentials: 'include'
-  });
-  
+
+  await session.storage.putJson(fileResult.meta.path, fileResult.file.toJson());
+
   return { blob: blobResult, file: fileResult };
 }
 ```
@@ -600,65 +552,54 @@ async function uploadFileWithMetadata(client, specs, fileData, metadata) {
 
 ```javascript
 import { useState, useEffect } from 'react';
-import init, { PubkySpecsBuilder } from 'pubky-app-specs';
+import { PubkySpecsBuilder } from 'pubky-app-specs';
 
 function usePubkySpecs(pubkyId) {
   const [specs, setSpecs] = useState(null);
   const [isReady, setIsReady] = useState(false);
   const [error, setError] = useState(null);
-  
+
   useEffect(() => {
-    async function initializeSpecs() {
-      try {
-        await init();
-        const specsBuilder = new PubkySpecsBuilder(pubkyId);
-        setSpecs(specsBuilder);
-        setIsReady(true);
-      } catch (err) {
-        setError(err.message);
-      }
-    }
-    
-    if (pubkyId) {
-      initializeSpecs();
+    if (!pubkyId) return;
+    try {
+      setSpecs(new PubkySpecsBuilder(pubkyId));
+      setIsReady(true);
+    } catch (err) {
+      setError(err.message);
     }
   }, [pubkyId]);
-  
+
   return { specs, isReady, error };
 }
 
 // Usage in component
-function PostCreator({ client, pubkyId }) {
+function PostCreator({ session, pubkyId }) {
   const { specs, isReady, error } = usePubkySpecs(pubkyId);
   const [content, setContent] = useState('');
-  
+
   const handleSubmit = async (e) => {
     e.preventDefault();
-    
+
     if (!specs || !isReady) return;
-    
+
     try {
       const postResult = specs.createPost(content, PubkyAppPostKind.Short);
-      
-      await client.fetch(postResult.meta.url, {
-        method: 'PUT',
-        body: JSON.stringify(postResult.post.toJson()),
-        credentials: 'include'
-      });
-      
+
+      await session.storage.putJson(postResult.meta.path, postResult.post.toJson());
+
       console.log('Post created:', postResult.meta.url);
       setContent('');
     } catch (err) {
       console.error('Failed to create post:', err.message);
     }
   };
-  
+
   if (error) return <div>Error: {error}</div>;
   if (!isReady) return <div>Loading specs...</div>;
-  
+
   return (
     <form onSubmit={handleSubmit}>
-      <textarea 
+      <textarea
         value={content}
         onChange={(e) => setContent(e.target.value)}
         placeholder="What's on your mind?"
@@ -696,22 +637,22 @@ cargo add pubky anyhow tokio
 ### Client Initialization
 
 ```javascript
-import { Client, Keypair, PublicKey } from "@synonymdev/pubky";
+import { Pubky, Keypair, PublicKey, Client } from "@synonymdev/pubky";
 
 // Default client (mainnet)
-const client = new Client();
+const pubky = new Pubky();
 
 // Testnet client for development
-const client = Client.testnet();
+const pubkyTestnet = Pubky.testnet();
 
 // Custom configuration
 const client = new Client({
   pkarr: {
     relays: ['https://your-pkarr-relay.example.com/'],
     requestTimeout: 2000
-  },
-  userMaxRecordAge: 3600
+  }
 });
+const pubkyCustom = Pubky.withClient(client);
 ```
 
 ### Authentication Flows
@@ -721,139 +662,130 @@ const client = new Client({
 const homeserver = PublicKey.from('your_homeserver_public_key_here');
 const signupToken = 'optional_invite_code';
 
+const signer = pubky.signer(keypair);
+
 try {
-  const session = await client.signup(keypair, homeserver, signupToken);
-  console.log('Signed up:', session.pubky().z32());
-  console.log('Capabilities:', session.capabilities());
+  const session = await signer.signup(homeserver, signupToken);
+  console.log('Signed up:', session.info.publicKey.toString());
+  console.log('Capabilities:', session.info.capabilities);
 } catch (error) {
   console.error('Signup failed:', error);
 }
 
-// Check session status
-const session = await client.session(publicKey);
-if (session) {
-  console.log('Active session with capabilities:', session.capabilities());
-} else {
-  console.log('Not signed in');
-}
-
 // Sign in existing user
-await client.signin(keypair);
+const session = await signer.signin();
 
 // Sign out
-await client.signout(publicKey);
+await session.signout();
 
 // Get user's homeserver
 try {
-  const homeserverKey = await client.getHomeserver(publicKey);
+  const homeserverKey = await pubky.getHomeserverOf(publicKey);
   console.log('Homeserver:', homeserverKey.z32());
 } catch (error) {
   console.log('No homeserver found');
 }
 
 // Republish homeserver record (for key managers)
-await client.republishHomeserver(keypair, homeserverPublicKey);
+await signer.pkdns.publishHomeserverIfStale(homeserverPublicKey);
 ```
 
 ### Data Operations
 
 ```javascript
-const userPubky = publicKey.z32();
+// All session-scoped storage uses the user's own /pub paths.
+const path = '/pub/example.com/todos.json';
+const data = [
+  { text: 'Buy milk', done: false },
+  { text: 'Walk the dog', done: true },
+];
 
-// PUT data
-const url = `pubky://${userPubky}/pub/example.com/profile.json`;
-const data = { name: 'Alice', bio: 'Developer' };
+// PUT JSON
+await session.storage.putJson(path, data);
 
-await client.fetch(url, {
-  method: 'PUT',
-  body: JSON.stringify(data),
-  credentials: 'include'
-});
+// GET JSON
+const todos = await session.storage.getJson(path);
+console.log('Todos:', todos);
 
-// GET data
-const response = await client.fetch(url);
-if (response.status === 200) {
-  const profile = await response.json();
-  console.log('Profile:', profile);
-}
+// DELETE
+await session.storage.delete(path);
 
-// DELETE data
-await client.fetch(url, {
-  method: 'DELETE',
-  credentials: 'include'
-});
-
-// PUT binary data
-const imageData = new Uint8Array([/* image bytes */]);
-await client.fetch(`pubky://${userPubky}/pub/images/avatar.png`, {
-  method: 'PUT',
-  body: imageData,
-  credentials: 'include'
-});
+// PUT binary data — e.g. an attachment for a todo
+const photoBytes = new Uint8Array([/* image bytes */]);
+await session.storage.putBytes('/pub/example.com/attachments/todo-1.png', photoBytes);
 ```
 
 ### Directory Listing
 
 ```javascript
-// List directory contents
-const dirUrl = `pubky://${userPubky}/pub/example.com/`;
+// List directory contents (path must end with `/`)
+const dirPath = '/pub/example.com/';
 
 // Basic listing
-const files = await client.list(dirUrl);
+const files = await session.storage.list(dirPath);
 
-// With options: list(url, cursor, reverse, limit, shallow)
-const files = await client.list(dirUrl, null, false, 10, false);
+// With options: list(path, cursor, reverse, limit, shallow)
+const firstTen = await session.storage.list(dirPath, null, false, 10, false);
 
 // Paginated listing
 let cursor = null;
 const allFiles = [];
+let batch;
 do {
-  const batch = await client.list(dirUrl, cursor, false, 50);
+  batch = await session.storage.list(dirPath, cursor, false, 50);
   allFiles.push(...batch);
   cursor = batch.length > 0 ? batch[batch.length - 1] : null;
 } while (cursor && batch.length === 50);
 
 // Shallow listing (directories and files, not flat)
-const directories = await client.list(dirUrl, null, false, null, true);
+const directories = await session.storage.list(dirPath, null, false, null, true);
 ```
 
 ### Third-Party Authorization
 
 ```javascript
+import { AuthFlowKind } from "@synonymdev/pubky";
+
 // App requests authorization
-const relay = "https://your-relay-service.example.com/link";
+// Synonym-hosted HTTP relay; pass your own URL to use a different one.
+// Base relay URL; the SDK appends the channel id internally.
+const relay = "https://httprelay.pubky.app/inbox";
 const capabilities = "/pub/myapp.com/:rw,/pub/shared/:r";
 
-const authRequest = client.authRequest(relay, capabilities);
-const authUrl = authRequest.url();
+const flow = pubky.startAuthFlow(capabilities, AuthFlowKind.signin(), relay);
+const authUrl = flow.authorizationUrl; // property, not method
 
 // Show QR code or redirect user to authUrl
 console.log('Visit:', authUrl);
 
 // Wait for user authorization
 try {
-  const authorizedPubky = await authRequest.response();
-  console.log('Authorized by:', authorizedPubky.z32());
-  
-  // Check session capabilities
-  const session = await client.session(authorizedPubky);
-  console.log('Granted capabilities:', session.capabilities());
+  const session = await flow.awaitApproval();
+  console.log('Authorized by:', session.info.publicKey.toString());
+  console.log('Granted capabilities:', session.info.capabilities);
 } catch (error) {
   console.error('Authorization failed:', error);
 }
 
-// User authorizes the request (in authenticator app)
-await client.sendAuthToken(keypair, authUrl);
+// User authorizes the request (in authenticator app, e.g. Pubky Ring)
+await signer.approveAuthRequest(authUrl);
 ```
 
 ## Pubky-Nexus API Integration
 
+> The Nexus REST API is on `/v0` and is **explicitly unstable** — breaking
+> changes can land at any time. Treat the endpoint shapes below as
+> illustrative; the Swagger UIs are the source of truth:
+> https://nexus.pubky.app/swagger-ui/ (production) and
+> https://nexus.staging.pubky.app/swagger-ui/ (staging).
+
 ### Base Configuration
 
 ```javascript
-const NEXUS_API_BASE_URL = process.env.NEXT_PUBLIC_NEXUS ? 
-  `${process.env.NEXT_PUBLIC_NEXUS}/v0` : 
-  'https://your-nexus-api.example.com/v0';
+// Synonym-hosted Nexus; set NEXT_PUBLIC_NEXUS to use a different instance.
+const NEXUS_API_BASE_URL = process.env.NEXT_PUBLIC_NEXUS ?
+  `${process.env.NEXT_PUBLIC_NEXUS}/v0` :
+  'https://nexus.pubky.app/v0';
 ```
 
 ### Server Info
@@ -985,32 +917,25 @@ const file = await axios.get(`${NEXUS_API_BASE_URL}/files/file/${fileUriEncoded}
 ## Error Handling Patterns
 
 ```javascript
-// Network errors
+// Network / auth errors — session.storage throws PubkyError on failure
 try {
-  const response = await client.fetch(url);
-  
-  switch (response.status) {
-    case 200:
-      return await response.json();
-    case 404:
-      console.log('Resource not found');
-      return null;
-    case 401:
+  return await session.storage.getJson(path);
+} catch (e) {
+  const error = e; // PubkyError
+  switch (error.name) {
+    case 'RequestError':
+      // Includes 4xx and 5xx server responses, plus malformed input.
+      console.error('Request failed:', error.message);
+      throw error;
+    case 'AuthenticationError':
       console.log('Not authenticated - sign in required');
       throw new Error('AUTHENTICATION_REQUIRED');
-    case 403:
-      console.log('Access forbidden - insufficient permissions');
-      throw new Error('PERMISSION_DENIED');
+    case 'PkarrError':
+      console.error('PKARR resolution failed:', error.message);
+      throw error;
     default:
-      const errorText = await response.text();
-      throw new Error(`HTTP ${response.status}: ${errorText}`);
+      throw error;
   }
-} catch (error) {
-  if (error.name === 'TypeError' && error.message.includes('fetch')) {
-    console.error('Network error:', error);
-    throw new Error('NETWORK_ERROR');
-  }
-  throw error;
 }
 
 // Validation errors
@@ -1036,7 +961,7 @@ try {
 5. Pubky-Nexus `nexus-watcher` detects event
 6. `nexus-watcher` updates Neo4j social graph and Redis caches
 7. Other users request feed via Nexus API
-8. `nexus-service` queries Redis/Neo4j and returns feed data
+8. `nexus-webapi` queries Redis/Neo4j and returns feed data
 
 ## Testing Strategies
 
@@ -1044,11 +969,10 @@ try {
 
 ```javascript
 import test from 'tape';
-import { Client, Keypair, PublicKey } from '@synonymdev/pubky';
-import init, { PubkySpecsBuilder, PubkyAppPostKind } from 'pubky-app-specs';
+import { Pubky, Keypair, PublicKey } from '@synonymdev/pubky';
+import { PubkySpecsBuilder, PubkyAppPostKind } from 'pubky-app-specs';
 
-test('data model validation', async (t) => {
-  await init();
+test('data model validation', (t) => {
   const pubkyId = 'operrr8wsbpr3ue9d4qj41ge1kcc6r7fdiy6o3ugjrrhi4y77rdo';
   const specs = new PubkySpecsBuilder(pubkyId);
 
@@ -1063,66 +987,57 @@ test('data model validation', async (t) => {
   t.ok(postResult.post, 'post created successfully');
   t.equal(postResult.post.content, "Hello world", 'post content correct');
   t.ok(postResult.meta.id.length === 13, 'post ID has correct length');
+  t.end();
 });
 
 test('authentication flow', async (t) => {
-  const client = Client.testnet();
+  const pubky = Pubky.testnet();
   const keypair = Keypair.random();
   const homeserver = PublicKey.from('your_homeserver_public_key_here');
 
-  // Test signup
-  const session = await client.signup(keypair, homeserver, null);
-  t.ok(session, 'signup successful');
-  t.equal(session.pubky().z32(), keypair.publicKey().z32(), 'correct session pubky');
+  const signer = pubky.signer(keypair);
 
-  // Test session check
-  const activeSession = await client.session(keypair.publicKey());
-  t.ok(activeSession, 'session exists after signup');
+  // Test signup
+  const session = await signer.signup(homeserver, null);
+  t.ok(session, 'signup successful');
+  t.equal(session.info.publicKey.z32(), keypair.publicKey().z32(), 'correct session pubky');
 
   // Test signout
-  await client.signout(keypair.publicKey());
-  const noSession = await client.session(keypair.publicKey());
-  t.notOk(noSession, 'no session after signout');
+  await session.signout();
+  t.end();
 });
 
 test('data operations with validation', async (t) => {
-  await init();
-  const client = Client.testnet();
+  const pubky = Pubky.testnet();
   const keypair = Keypair.random();
   const homeserver = PublicKey.from('your_homeserver_public_key_here');
-  
-  await client.signup(keypair, homeserver, null);
-  
+
+  const session = await pubky.signer(keypair).signup(homeserver, null);
+
   const pubkyId = keypair.publicKey().z32();
   const specs = new PubkySpecsBuilder(pubkyId);
-  
+
   // Create and store validated post
   const postResult = specs.createPost("Test content", PubkyAppPostKind.Short, null, null, null);
-  
-  // Test PUT
-  const putResponse = await client.fetch(postResult.meta.url, {
-    method: 'PUT',
-    body: JSON.stringify(postResult.post.toJson()),
-    credentials: 'include'
-  });
-  t.equal(putResponse.status, 200, 'PUT successful');
 
-  // Test GET
-  const getResponse = await client.fetch(postResult.meta.url);
-  t.equal(getResponse.status, 200, 'GET successful');
-  const retrieved = await getResponse.json();
+  // PUT
+  await session.storage.putJson(postResult.meta.path, postResult.post.toJson());
+
+  // GET
+  const retrieved = await session.storage.getJson(postResult.meta.path);
   t.equal(retrieved.content, "Test content", 'content matches');
 
-  // Test DELETE
-  const deleteResponse = await client.fetch(postResult.meta.url, {
-    method: 'DELETE',
-    credentials: 'include'
-  });
-  t.equal(deleteResponse.status, 200, 'DELETE successful');
+  // DELETE
+  await session.storage.delete(postResult.meta.path);
 
-  // Test GET after delete
-  const notFoundResponse = await client.fetch(postResult.meta.url);
-  t.equal(notFoundResponse.status, 404, 'resource not found after delete');
+  // Confirm gone — getJson throws on 404
+  try {
+    await session.storage.getJson(postResult.meta.path);
+    t.fail('expected getJson to throw after delete');
+  } catch {
+    t.pass('resource not found after delete');
+  }
+  t.end();
 });
 ```
 
@@ -1130,62 +1045,40 @@ test('data operations with validation', async (t) => {
 
 ```javascript
 import { createContext, useContext, useEffect, useState } from 'react';
-import { Client, Keypair, PublicKey, decryptRecoveryFile } from '@synonymdev/pubky';
-import init, { PubkySpecsBuilder } from 'pubky-app-specs';
+import { Pubky, Keypair, Session } from '@synonymdev/pubky';
+import { PubkySpecsBuilder } from 'pubky-app-specs';
 
 const PubkyContext = createContext();
+const SESSION_KEY = 'pubky_session';
 
 export function PubkyProvider({ children }) {
-  const [client] = useState(() => Client.testnet());
-  const [currentUser, setCurrentUser] = useState(null);
+  const [pubky] = useState(() => Pubky.testnet());
   const [session, setSession] = useState(null);
   const [specs, setSpecs] = useState(null);
 
+  // Restore an exported session on mount.
   useEffect(() => {
-    const savedUser = localStorage.getItem('pubky_user');
-    if (savedUser) {
-      checkSession(PublicKey.from(savedUser));
-    }
-  }, []);
+    const exported = localStorage.getItem(SESSION_KEY);
+    if (!exported) return;
+    pubky.restoreSession(exported)
+      .then(setSession)
+      .catch(() => localStorage.removeItem(SESSION_KEY));
+  }, [pubky]);
 
+  // Re-create the specs builder whenever the session changes.
   useEffect(() => {
-    async function initializeSpecs() {
-      if (currentUser) {
-        await init();
-        const specsBuilder = new PubkySpecsBuilder(currentUser.z32());
-        setSpecs(specsBuilder);
-      } else {
-        setSpecs(null);
-      }
+    if (session) {
+      setSpecs(new PubkySpecsBuilder(session.info.publicKey.z32()));
+    } else {
+      setSpecs(null);
     }
-    
-    initializeSpecs();
-  }, [currentUser]);
+  }, [session]);
 
-  async function checkSession(publicKey) {
+  async function signIn(keypair) {
     try {
-      const activeSession = await client.session(publicKey);
-      if (activeSession) {
-        setCurrentUser(publicKey);
-        setSession(activeSession);
-      }
-    } catch (error) {
-      console.error('Session check failed:', error);
-    }
-  }
-
-  async function signIn(recoveryFile, passphrase) {
-    try {
-      const keypair = decryptRecoveryFile(recoveryFile, passphrase);
-      await client.signin(keypair);
-      
-      const publicKey = keypair.publicKey();
-      const newSession = await client.session(publicKey);
-      
-      setCurrentUser(publicKey);
-      setSession(newSession);
-      localStorage.setItem('pubky_user', publicKey.z32());
-      
+      const next = await pubky.signer(keypair).signin();
+      localStorage.setItem(SESSION_KEY, next.export());
+      setSession(next);
       return { success: true };
     } catch (error) {
       return { success: false, error: error.message };
@@ -1193,24 +1086,21 @@ export function PubkyProvider({ children }) {
   }
 
   async function signOut() {
-    if (currentUser) {
-      await client.signout(currentUser);
-      setCurrentUser(null);
-      setSession(null);
-      setSpecs(null);
-      localStorage.removeItem('pubky_user');
-    }
+    if (!session) return;
+    await session.signout();
+    localStorage.removeItem(SESSION_KEY);
+    setSession(null);
   }
 
   const value = {
-    client,
-    currentUser,
+    pubky,
     session,
+    currentUser: session?.info.publicKey ?? null,
     specs,
     signIn,
     signOut,
-    isSignedIn: !!currentUser,
-    isReady: !!specs
+    isSignedIn: !!session,
+    isReady: !!specs,
   };
 
   return (
@@ -1235,27 +1125,21 @@ export function usePubky() {
 class Environment {
   static getConfig() {
     const env = process.env.NODE_ENV || 'development';
-    
+
     const configs = {
       development: {
-        client: () => Client.testnet(),
+        pubky: () => Pubky.testnet(),
         homeserver: 'your_testnet_homeserver_key_here',
-        relays: ['http://localhost:15412/link']
+        relay: 'http://localhost:15412/inbox/'
       },
-      
+
       production: {
-        client: () => new Client({
-          pkarr: {
-            relays: ['https://your-pkarr-relay1.example.com/', 'https://your-pkarr-relay2.example.com/'],
-            requestTimeout: 10000
-          },
-          userMaxRecordAge: 3600
-        }),
+        pubky: () => new Pubky(),
         homeserver: 'your_production_homeserver_key_here',
-        relays: ['https://your-http-relay.example.com/link']
+        relay: 'https://httprelay.pubky.app/inbox'
       }
     };
-    
+
     return configs[env] || configs.development;
   }
 }
@@ -1285,13 +1169,12 @@ class Environment {
 
 ### What to Remember
 - All data operations require proper authentication via sessions
-- Only `/pub/` directories are publicly readable
+- Only `/pub/*` is reachable on the tenant API: `GET`/`HEAD` are public, `PUT`/`DELETE` require a session with a write capability; anything else (e.g. `/priv/*`) returns `403 Forbidden` regardless of capability. More granular permission models may be implemented in the future.
 - Write operations require appropriate capabilities
 - Homeserver records should be republished periodically
 - Use testnet for development, mainnet for production
 - Error handling is crucial for network resilience
 - Recovery files are encrypted with user passphrases
-- Always initialize WASM module before using pubky-app-specs
 - Data models are automatically validated and sanitized
 - IDs and paths are generated following strict conventions
 
@@ -1301,7 +1184,6 @@ class Environment {
 - Homeserver endpoints must be resolved via Pkarr network
 - Sessions contain capabilities that determine permissions
 - Z-base-32 encoding is used for public key representations
-- pubky-app-specs requires WASM initialization before use
 - Validation errors provide specific messages about what's wrong
 - All data models follow the `/pub/pubky.app/` path convention
 
