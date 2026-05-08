@@ -1169,6 +1169,7 @@ class Environment {
 
 ### What to Remember
 - All data operations require proper authentication via sessions
+- Only `/pub/*` is reachable on the tenant API: `GET`/`HEAD` are public, `PUT`/`DELETE` require a session with a write capability; anything else (e.g. `/priv/*`) returns `403 Forbidden` regardless of capability. More granular permission models may be implemented in the future.
 - Write operations require appropriate capabilities
 - Homeserver records should be republished periodically
 - Use testnet for development, mainnet for production
