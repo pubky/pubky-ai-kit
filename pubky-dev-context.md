@@ -454,7 +454,6 @@ try {
 ### Invalid Public Key Errors
 ```javascript
 try {
-  // pubky-app-specs 0.4+: no init() needed, builder constructor validates the id.
   const specs = new PubkySpecsBuilder("invalid_pubky_id");
 } catch (error) {
   console.error("Invalid public key:", error.message);
@@ -1069,7 +1068,6 @@ export function PubkyProvider({ children }) {
   // Re-create the specs builder whenever the session changes.
   useEffect(() => {
     if (session) {
-      // pubky-app-specs 0.4+ does not require init().
       setSpecs(new PubkySpecsBuilder(session.info.publicKey.z32()));
     } else {
       setSpecs(null);
