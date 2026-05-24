@@ -2,6 +2,22 @@
 
 > **CRITICAL**: This guide contains only actual functionality from the Pubky protocol. Do not mock, simulate, or invent any features not explicitly documented here. All code examples are based on real API implementations.
 
+## Current Baseline
+
+As of 2026-05-24, generate new Pubky examples against:
+
+- Rust SDK crate: `pubky` 0.8.x
+- JavaScript SDK: `@synonymdev/pubky` 0.8.x
+- React Native SDK: `@synonymdev/react-native-pubky` 0.11.x
+- App specs: `pubky-app-specs` 0.5.x
+- Pubky Backup: desktop app 0.5.x
+
+Important release-era facts:
+
+- `pubky-core` 0.8.0 removed LMDB support. Homeserver operators must use PostgreSQL; migrations from older LMDB deployments must go through 0.7.x first.
+- The SDK exposes resumable third-party auth flows and first-class event streams.
+- Pubky Backup is released, but it is a local one-way backup for public `/pub` data. It is not homeserver mirroring, cloud sync, restore, or two-way sync.
+
 ## Core Architecture & Concepts
 
 ### Pubky Protocol Overview
@@ -11,23 +27,25 @@ Pubky is an open protocol for per-public-key backends enabling censorship-resist
 
 **Client** - Available in Rust and JavaScript/WebAssembly
 - Handles authentication, data operations, protocol communication
-- NPM package: `@synonymdev/pubky`
-- React Native package: `@synonymdev/react-native-pubky`
+- NPM package: `@synonymdev/pubky` 0.8.x
+- React Native package: `@synonymdev/react-native-pubky` 0.11.x
+- Prefer one shared `Pubky` facade per app/process instead of creating a new client for every request.
 
 **Pubky App Specs** - Data model validation and creation
 - NPM package: `pubky-app-specs`
-- Version: 0.4.x
+- Version: 0.5.x
 - WASM-based validation and ID generation
 - Provides structured JSON models for social media features
 
 **Homeserver** - User's personal backend
 - Provides storage and HTTP endpoints
 - Validates authentication tokens and manages user data
-- App-facing API is **file storage only**: HTTP `PUT` / `GET` / `DELETE` against `pubky://<pk>/pub/...` paths. Each entry is an opaque byte blob with a MIME type — typically JSON (e.g. `pubky-app-specs` post/profile records) but equally images, audio, video, PDFs, encrypted ciphertext, or any other format the app chooses. No protocol-level restriction on content type.
-- Supports both public and private data (current implementations focus on public data)
+- App-facing API is **file storage only**: HTTP `PUT` / `GET` / `DELETE` against `/pub/...` paths on the signed-in user's session, and read-only public addressing through `pubky<pk>/pub/...` or `pubky://<pk>/pub/...`. Each entry is an opaque byte blob with a MIME type - typically JSON (e.g. `pubky-app-specs` post/profile records) but equally images, audio, video, PDFs, encrypted ciphertext, or any other format the app chooses. No protocol-level restriction on content type.
+- Public `/pub` data is implemented today. Private app storage roots such as `/priv` are not formalized and must not be described as available.
 - Can be operated by individuals, cooperatives, or commercial entities
-- Internally the homeserver uses **PostgreSQL** for its own metadata — users (Ed25519 pubkey + quota), sessions (capability-scoped auth), entries (per-file path, blake3 hash, length, MIME, timestamps), events (PUT/DEL stream consumed by Nexus and other subscribers), and signup codes. **Applications never connect to PostgreSQL directly** — they only see the file API.
-- Default per-request payload limit: **10 MB** (returns `413` past that). This is independent of per-user quotas, which are operator-defined — for reference, Synonym's public homeserver enforces 1 GB per user with a 10 MB per file ceiling.
+- Internally the homeserver uses **PostgreSQL** for its own metadata - users (Ed25519 pubkey + quota), sessions (capability-scoped auth), entries (per-file path, blake3 hash, length, MIME, timestamps), events (PUT/DEL stream consumed by Nexus, Pubky Backup, and other subscribers), and signup codes. **Applications never connect to PostgreSQL directly** - they only see the file API.
+- Default per-request payload limit: **10 MB** (returns `413` past that). This is independent of per-user quotas, which are operator-defined - for reference, Synonym's public homeserver enforces 1 GB per user with a 10 MB per file ceiling.
+- Homeservers may enforce per-user rate limits. Treat `429` as a normal operational condition and retry with backoff.
 
 **Pkarr Network** - Distributed DNS alternative
 - Uses public keys as domains via Mainline DHT
@@ -41,14 +59,34 @@ Pubky is an open protocol for per-public-key backends enabling censorship-resist
 - Components: nexus-watcher, nexus-webapi, nexus-common, nexusd
 - Databases: Neo4j (social graph), Redis (caching)
 
+**Pubky Backup** - Local backup application
+- Maintains a local copy of one or more users' public `/pub` data.
+- Uses homeserver event streams and persisted cursors to keep local files up to date.
+- Provides local snapshots and activity logs.
+- Current release is one-way local backup only. Do not claim it restores data to homeservers, mirrors between homeservers, or provides cloud storage.
+
 ### URL Structure
 ```
+// Preferred public-storage address used by SDK APIs
+pubky<public_key>/pub/<path>
+
+// URL/deeplink form also accepted by SDK parsers
 pubky://<public_key>/pub/<path>
+
+// Signed-in session storage path
+/pub/<path>
 ```
-- `public_key`: z-base-32 encoded public key (52 characters)
+- `public_key`: z-base-32 encoded public key, normally displayed with the `pubky` prefix.
 - `/pub`: the only protocol-required top-level directory; everything after is app-chosen.
 
-Only `/pub` is formalized today. The protocol leaves room for other top-level roots alongside it (`/priv` for private/encrypted data is the long-standing placeholder), but none have been formalized yet — more may follow.
+Use the signed-in session path (`/pub/app/file.json`) when reading or writing the current user's own storage through `session.storage`. Use the addressed form (`pubky<user>/pub/app/file.json` or `pubky://<user>/pub/app/file.json`) when reading someone else's public data through `pubky.publicStorage`.
+
+Public key string formats matter:
+
+- Display/human identifier: `publicKey.toString()` returns `pubky<z32>`. Use this in UI, logs, and human-facing references.
+- Transport/storage identifier: `publicKey.z32()` returns raw z-base-32. Use this for hostnames, `_pubky.<z32>` DNS names, headers, query params, serde/JSON fields that expect a raw key, and database keys.
+
+Only `/pub` is formalized today. The protocol leaves room for other top-level roots alongside it (`/priv` for private/encrypted data is the long-standing placeholder), but none have been formalized yet.
 
 By convention the first segment under `/pub` is a **scope**, and an app may touch several. Real-world examples:
 
@@ -63,11 +101,15 @@ Common scope flavors:
 ### Authentication Model
 Uses AuthTokens - signed timestamps with capabilities that prove ownership of a public key and grant specific permissions. Tokens are valid for a 3-minute window to account for clock drift.
 
+Third-party apps should use SDK auth flows instead of asking users to paste keys or mnemonics. `startAuthFlow()` creates a `pubkyauth://` authorization URL for a key manager such as Pubky Ring, and `resumeAuthFlow()` can recover the same flow after a page refresh or app switch. The authorization URL contains a `client_secret`; store it only in short-lived storage such as `sessionStorage`, and delete it once approved or abandoned.
+
+An auth flow has state. Do not call `awaitApproval()` or `tryPollOnce()` concurrently on the same flow, and do not keep polling after completion; the SDK can return `ClientStateError`.
+
 > **Known limitation**: All sessions currently share a single authentication cookie ([pubky-core#122](https://github.com/pubky/pubky-core/issues/122)) - signing into App B overwrites App A's session. A rework is in progress, building on a JWT-based solution.
 
 ### Core Principles
 
-**Credible Exit** - Users can migrate data and identity between homeservers without losing content, connections, or identity. This prevents vendor lock-in and ensures user sovereignty.
+**Credible Exit** - Users can migrate identity by republishing homeserver records, and they can keep independent local copies of public data with Pubky Backup. Full homeserver-to-homeserver mirroring and automated restore are planned/future work, not current shipped behavior.
 
 **Censorship Resistance** - Achieved through flexible hosting and decentralized identity. Users can circumvent censorship by migrating to different homeservers while maintaining their public key identity.
 
@@ -295,7 +337,7 @@ async function createAndStorePost(keypair, content) {
   // Initialize
   const pubky = Pubky.testnet();
 
-  const pubkyId = keypair.publicKey().z32();
+  const pubkyId = keypair.publicKey.z32();
   const specs = new PubkySpecsBuilder(pubkyId);
 
   // Ensure authenticated
@@ -334,14 +376,16 @@ async function updateProfile(session, specs, profileData) {
   return userResult;
 }
 
-async function getProfile(pubky, pubkyId) {
-  // Reading another user's public data → pubky.publicStorage
-  const url = `pubky://${pubkyId}/pub/pubky.app/profile.json`;
+async function getProfile(pubky, publicKey) {
+  // Reading another user's public data -> pubky.publicStorage.
+  // `publicKey` may be a PublicKey object or a display string like pubky<z32>.
+  const user = typeof publicKey === 'string' ? publicKey : publicKey.toString();
+  const address = `${user}/pub/pubky.app/profile.json`;
   try {
-    return await pubky.publicStorage.getJson(url);
+    return await pubky.publicStorage.getJson(address);
   } catch (e) {
     const error = e; // PubkyError
-    if (error.message.includes("404")) return null; // No profile found
+    if (error.name === 'RequestError' && error.data?.statusCode === 404) return null;
     throw e;
   }
 }
@@ -744,32 +788,79 @@ const directories = await session.storage.list(dirPath, null, false, null, true)
 ### Third-Party Authorization
 
 ```javascript
-import { AuthFlowKind } from "@synonymdev/pubky";
+import { AuthFlowKind, validateCapabilities } from "@synonymdev/pubky";
 
-// App requests authorization
+// App requests authorization.
 // Synonym-hosted HTTP relay; pass your own URL to use a different one.
-// Base relay URL; the SDK appends the channel id internally.
 const relay = "https://httprelay.pubky.app/inbox";
 const capabilities = "/pub/myapp.com/:rw,/pub/shared/:r";
+
+// Validate user-constructed capability strings before starting a flow.
+validateCapabilities(capabilities);
 
 const flow = pubky.startAuthFlow(capabilities, AuthFlowKind.signin(), relay);
 const authUrl = flow.authorizationUrl; // property, not method
 
-// Show QR code or redirect user to authUrl
+// The URL contains client_secret. The relay inbox is short-lived; treat it
+// as a roughly five-minute recovery window, not durable app state.
+// If a browser app must survive refresh, save it in sessionStorage only and
+// remove it after completion/abandonment.
+sessionStorage.setItem('pubky_auth_url', authUrl);
+
+// Show QR code, deeplink, or redirect user to authUrl.
 console.log('Visit:', authUrl);
 
-// Wait for user authorization
 try {
-  const session = await flow.awaitApproval();
+  const resumed = pubky.resumeAuthFlow(
+    sessionStorage.getItem('pubky_auth_url') ?? authUrl
+  );
+  const session = await resumed.awaitApproval();
+  sessionStorage.removeItem('pubky_auth_url');
   console.log('Authorized by:', session.info.publicKey.toString());
   console.log('Granted capabilities:', session.info.capabilities);
 } catch (error) {
+  sessionStorage.removeItem('pubky_auth_url');
   console.error('Authorization failed:', error);
 }
 
-// User authorizes the request (in authenticator app, e.g. Pubky Ring)
+// User authorizes the request in a key manager, e.g. Pubky Ring.
 await signer.approveAuthRequest(authUrl);
 ```
+
+## Event Streams
+
+Use event streams for indexing, backup, sync, and watchers. Do not poll or recursively list whole `/pub` trees when an event stream is available.
+
+```javascript
+// Follow one user's homeserver events from the last persisted cursor.
+const stream = await pubky
+  .eventStreamForUser(userPublicKey, lastCursor ?? undefined)
+  .path('/pub/pubky.app/')
+  .limit(50)
+  .subscribe();
+
+const reader = stream.getReader();
+while (true) {
+  const { value: event, done } = await reader.read();
+  if (done) break;
+
+  // event.eventType is 'PUT' or 'DEL'.
+  // event.cursor is the resumable checkpoint. Persist it after processing.
+  // event.contentHash is present for PUT events.
+  if (event.eventType === 'PUT') {
+    const data = await pubky.publicStorage.getBytes(event.resource.toPubkyId());
+    await updateIndex(event.resource.path, data, event.contentHash);
+  } else {
+    await removeFromIndex(event.resource.path);
+  }
+
+  await saveCursor(event.cursor);
+}
+```
+
+For multiple users on a known homeserver, prefer `eventStreamFor(homeserver).addUsers(...)` so the SDK does not repeat PKARR lookups. Keep batches modest, persist cursors often, and back off on `429` because homeservers may enforce per-user limits.
+
+`live()` streams historical events and then stays open for new events. `reverse()` gives newest-first historical results and closes; do not combine `live()` and `reverse()` on the same builder.
 
 ## Pubky-Nexus API Integration
 
@@ -916,39 +1007,42 @@ const file = await axios.get(`${NEXUS_API_BASE_URL}/files/file/${fileUriEncoded}
 
 ## Error Handling Patterns
 
+SDK errors expose a stable `name` and, for many request failures, structured `data.statusCode`. Prefer structured checks over string matching. Known JS SDK names are `RequestError`, `InvalidInput`, `AuthenticationError`, `PkarrError`, `ClientStateError`, and `InternalError`.
+
 ```javascript
-// Network / auth errors — session.storage throws PubkyError on failure
 try {
   return await session.storage.getJson(path);
 } catch (e) {
   const error = e; // PubkyError
   switch (error.name) {
     case 'RequestError':
-      // Includes 4xx and 5xx server responses, plus malformed input.
+      if (error.data?.statusCode === 404) return null;
+      if (error.data?.statusCode === 429) {
+        await backoffAndRetry();
+        return;
+      }
       console.error('Request failed:', error.message);
       throw error;
     case 'AuthenticationError':
-      console.log('Not authenticated - sign in required');
       throw new Error('AUTHENTICATION_REQUIRED');
     case 'PkarrError':
       console.error('PKARR resolution failed:', error.message);
+      throw error;
+    case 'ClientStateError':
+      console.error('SDK object was used in an invalid state:', error.message);
+      throw error;
+    case 'InvalidInput':
+      console.error('Invalid SDK input:', error.message);
       throw error;
     default:
       throw error;
   }
 }
 
-// Validation errors
 try {
   const publicKey = PublicKey.from(userInput);
 } catch (error) {
   console.error('Invalid public key format');
-}
-
-try {
-  const keypair = Keypair.fromSecretKey(invalidSecret);
-} catch (error) {
-  console.error('Expected 32-byte secret key');
 }
 ```
 
@@ -957,11 +1051,24 @@ try {
 1. User creates post in frontend app
 2. App uses `pubky-app-specs` to validate and create structured post data
 3. App uses `@synonymdev/pubky` client to write post data to user's Homeserver
-4. Homeserver stores data and emits event
-5. Pubky-Nexus `nexus-watcher` detects event
-6. `nexus-watcher` updates Neo4j social graph and Redis caches
-7. Other users request feed via Nexus API
-8. `nexus-webapi` queries Redis/Neo4j and returns feed data
+4. Homeserver stores data and emits a `PUT` event with a cursor and content hash
+5. Pubky-Nexus, Pubky Backup, or another subscriber consumes the event stream
+6. Nexus updates Neo4j social graph and Redis caches
+7. Pubky Backup fetches the changed public resource and stores a local copy
+8. Other users request feed via Nexus API or read public resources directly
+
+## Pubky Backup
+
+Pubky Backup is the released local credible-exit tool for public data. It is a desktop app with a Rust core and Tauri frontend. Its core model is useful when generating backup/indexer code:
+
+- Add one or more pubkeys, validate homeserver discovery, and start a controller per key.
+- Subscribe to homeserver event streams with a persisted cursor.
+- Process `PUT` by fetching the public resource and writing it locally.
+- Process `DEL` by deleting the local file.
+- Persist the cursor frequently so sync is resumable.
+- Support force sync, remove-key-with-data-preserved, delete-key-with-data-removed, activity logs, and snapshots.
+
+Current behavior is intentionally one-way. Do not tell users Pubky Backup can restore to a homeserver, mirror one homeserver to another, perform cloud backup, or do two-way sync. Those are roadmap/open-work areas.
 
 ## Testing Strategies
 
@@ -1000,7 +1107,7 @@ test('authentication flow', async (t) => {
   // Test signup
   const session = await signer.signup(homeserver, null);
   t.ok(session, 'signup successful');
-  t.equal(session.info.publicKey.z32(), keypair.publicKey().z32(), 'correct session pubky');
+  t.equal(session.info.publicKey.z32(), keypair.publicKey.z32(), 'correct session pubky');
 
   // Test signout
   await session.signout();
@@ -1014,7 +1121,7 @@ test('data operations with validation', async (t) => {
 
   const session = await pubky.signer(keypair).signup(homeserver, null);
 
-  const pubkyId = keypair.publicKey().z32();
+  const pubkyId = keypair.publicKey.z32();
   const specs = new PubkySpecsBuilder(pubkyId);
 
   // Create and store validated post
@@ -1153,8 +1260,9 @@ class Environment {
 - Capability-based authorization system
 - HTTP API for data operations (PUT, GET, DELETE)
 - Directory listing with pagination
-- Third-party app authorization flows
-- Recovery file system for key backup/restore
+- Third-party app authorization flows, including auth-flow resume
+- Event streams for indexing, backup, and sync
+- Encrypted recovery files for key backup/restore
 - Cross-platform clients (Rust, JavaScript/WASM)
 - Validated data models with auto-generated IDs and paths
 
@@ -1173,8 +1281,9 @@ class Environment {
 - Write operations require appropriate capabilities
 - Homeserver records should be republished periodically
 - Use testnet for development, mainnet for production
-- Error handling is crucial for network resilience
-- Recovery files are encrypted with user passphrases
+- Error handling is crucial for network resilience, especially `404`, `429`, auth failures, and PKARR failures
+- Recovery files are encrypted with user passphrases; native `.sess` files are bearer credentials and must be treated like passwords
+- Browser `session.export()` stores public session metadata and still depends on the homeserver auth cookie
 - Data models are automatically validated and sanitized
 - IDs and paths are generated following strict conventions
 
@@ -1183,9 +1292,14 @@ class Environment {
 - All examples are based on actual working implementations
 - Homeserver endpoints must be resolved via Pkarr network
 - Sessions contain capabilities that determine permissions
-- Z-base-32 encoding is used for public key representations
-- Validation errors provide specific messages about what's wrong
+- Use `publicKey.toString()` for display `pubky<z32>` identifiers and `publicKey.z32()` for transport/storage raw z-base-32 identifiers
+- Validate inputs with SDK constructors/helpers instead of hand-parsing keys or capability strings
 - All data models follow the `/pub/pubky.app/` path convention
+- Do not claim private storage, homeserver mirroring, backup restore, cloud backup, or two-way backup sync as shipped features
+
+### Shipped vs Planned
+- Shipped: public `/pub` storage, capability-scoped sessions, PKARR homeserver discovery, app specs, resumable auth flows, event streams, local Pubky Backup, and PostgreSQL-backed homeservers.
+- Planned/future: private app storage roots, signed/guarded/encrypted data as general app primitives, homeserver mirroring, backup restore, cloud backup, and two-way backup sync.
 
 ## Development checklist
 When creating new pubky projects make sure you follow the checklist:
@@ -1195,6 +1309,8 @@ When creating new pubky projects make sure you follow the checklist:
 - Debug logging with verbose option
 - Robust error handling with categorization
 - Session persistence across operations
+- Auth-flow resume handling where browser refresh/app switch is possible
+- Event-stream cursor persistence for sync/indexing/backup workflows
 - Recovery file handling with validation
 - Usage examples and help text
 ### Error Handling
