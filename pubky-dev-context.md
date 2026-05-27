@@ -1057,7 +1057,7 @@ try {
 
 ## Pubky Backup
 
-Pubky Backup is the released local credible-exit tool for public data. It is a desktop app with a Rust core and Tauri frontend. Its core model is useful when generating backup/indexer code:
+Pubky Backup is the local credible-exit tool for public data. It is a desktop app with a Rust core and Tauri frontend. Its core model is useful when generating backup/indexer code:
 
 - Add one or more pubkeys, validate homeserver discovery, and start a controller per key.
 - Subscribe to homeserver event streams with a persisted cursor.
