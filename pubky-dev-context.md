@@ -2,22 +2,6 @@
 
 > **CRITICAL**: This guide contains only actual functionality from the Pubky protocol. Do not mock, simulate, or invent any features not explicitly documented here. All code examples are based on real API implementations.
 
-## Current Baseline
-
-As of 2026-05-24, generate new Pubky examples against:
-
-- Rust SDK crate: `pubky` 0.8.x
-- JavaScript SDK: `@synonymdev/pubky` 0.8.x
-- React Native SDK: `@synonymdev/react-native-pubky` 0.11.x
-- App specs: `pubky-app-specs` 0.5.x
-- Pubky Backup: desktop app 0.5.x
-
-Important release-era facts:
-
-- `pubky-core` 0.8.0 removed LMDB support. Homeserver operators must use PostgreSQL; migrations from older LMDB deployments must go through 0.7.x first.
-- The SDK exposes resumable third-party auth flows and first-class event streams.
-- Pubky Backup is released, but it is a local one-way backup for public `/pub` data. It is not homeserver mirroring, cloud sync, restore, or two-way sync.
-
 ## Core Architecture & Concepts
 
 ### Pubky Protocol Overview
@@ -27,8 +11,9 @@ Pubky is an open protocol for per-public-key backends enabling censorship-resist
 
 **Client** - Available in Rust and JavaScript/WebAssembly
 - Handles authentication, data operations, protocol communication
-- NPM package: `@synonymdev/pubky` 0.8.x
-- React Native package: `@synonymdev/react-native-pubky` 0.11.x
+- Rust crate: `pubky`
+- NPM package: `@synonymdev/pubky`
+- React Native package: `@synonymdev/react-native-pubky`
 - Prefer one shared `Pubky` facade per app/process instead of creating a new client for every request.
 
 **Pubky App Specs** - Data model validation and creation
@@ -36,11 +21,12 @@ Pubky is an open protocol for per-public-key backends enabling censorship-resist
 - Version: 0.5.x
 - WASM-based validation and ID generation
 - Provides structured JSON models for social media features
+- Includes `collection` posts; use `createCollectionPost()` and only store canonical pubky.app post URIs in Collection items.
 
 **Homeserver** - User's personal backend
 - Provides storage and HTTP endpoints
 - Validates authentication tokens and manages user data
-- App-facing API is **file storage only**: HTTP `PUT` / `GET` / `DELETE` against `/pub/...` paths on the signed-in user's session, and read-only public addressing through `pubky<pk>/pub/...` or `pubky://<pk>/pub/...`. Each entry is an opaque byte blob with a MIME type - typically JSON (e.g. `pubky-app-specs` post/profile records) but equally images, audio, video, PDFs, encrypted ciphertext, or any other format the app chooses. No protocol-level restriction on content type.
+- App-facing API is **file storage only**: HTTP `PUT` / `GET` / `DELETE` against `pubky://<pk>/pub/...` paths. Each entry is an opaque byte blob with a MIME type — typically JSON (e.g. `pubky-app-specs` post/profile records) but equally images, audio, video, PDFs, encrypted ciphertext, or any other format the app chooses. No protocol-level restriction on content type.
 - Public `/pub` data is implemented today. Private app storage roots such as `/priv` are not formalized and must not be described as available.
 - Can be operated by individuals, cooperatives, or commercial entities
 - Internally the homeserver uses **PostgreSQL** for its own metadata - users (Ed25519 pubkey + quota), sessions (capability-scoped auth), entries (per-file path, blake3 hash, length, MIME, timestamps), events (PUT/DEL stream consumed by Nexus, Pubky Backup, and other subscribers), and signup codes. **Applications never connect to PostgreSQL directly** - they only see the file API.
@@ -177,7 +163,7 @@ import { PubkyAppPostKind } from "pubky-app-specs";
 // Create a simple text post
 const postResult = specs.createPost(
   "Hello world! This is my first post.",      // content
-  PubkyAppPostKind.Short,                     // kind: Short, Long, Image, Video, Link, File
+  PubkyAppPostKind.Short,                     // kind: Short, Long, Image, Video, Link, File, Collection
   null,                                       // parent (for replies)
   null,                                       // embed (for reposts)
   ["pubky://user_id/pub/pubky.app/files/1"]   // attachments (optional)
@@ -195,6 +181,17 @@ const editedResult = specs.editPost(
   post,                                       // original post object
   meta.id,                                    // original post ID
   "Updated content for my first post!"       // new content
+);
+
+// Create a Collection post with a typed JSON envelope in `content`.
+// Items must be exact pubky.app post URIs with a valid 52-char pubky id
+// and a valid 13-char Crockford post id.
+const collectionResult = specs.createCollectionPost(
+  "AI papers",
+  "Best stuff",
+  [
+    "pubky://operrr8wsbpr3ue9d4qj41ge1kcc6r7fdiy6o3ugjrrhi4y77rdo/pub/pubky.app/posts/00321FCW75ZFY"
+  ]
 );
 ```
 
@@ -283,7 +280,7 @@ const feedResult = specs.createFeed(
   "following",                               // reach: "following" | "followers" | "friends" | "all"
   "columns",                                 // layout: "columns" | "wide" | "visual"
   "recent",                                  // sort: "recent" | "popularity"
-  "image",                                   // content filter (optional): "short" | "long" | "image" | "video" | "link" | "file"
+  "image",                                   // content filter (optional): "short" | "long" | "image" | "video" | "link" | "file" | "collection"
   "Bitcoin Developers"                       // feed name
 );
 ```
@@ -431,10 +428,11 @@ async function bookmarkPost(session, specs, postUri) {
 - **Status**: Max 50 characters
 
 ### Post Validation
-- **Content**: Max 1000 chars (Short), 50000 chars (Long), cannot be "[DELETED]"
-- **Kind**: Must be valid PubkyAppPostKind enum value
+- **Content**: Max 2000 chars (Short), 50000 chars (Long), cannot be "[DELETED]"
+- **Kind**: Must be valid PubkyAppPostKind enum value: Short, Long, Image, Video, Link, File, or Collection. `Unknown` is for forward-compatible deserialization only and should not be generated.
 - **Parent**: Must be valid URI if present
-- **Attachments**: Each must be valid URI
+- **Attachments**: Max 4; each must be a valid `pubky`, `http`, or `https` URI, max 200 chars
+- **Collection**: Use `createCollectionPost(name, description, items)`. `name` is 1-100 chars, `description` is optional up to 500 chars, `items` is max 100 exact post URIs of the form `pubky://<pubky-id>/pub/pubky.app/posts/<post-id>`, and parent/embed/attachments must be unset.
 
 ### Tag Validation
 - **Label**: 1-20 characters, auto-sanitized (lowercase, no whitespace)
@@ -560,7 +558,7 @@ async function saveCustomFeed(session, specs, feedConfig) {
     feedConfig.reach,         // "following" | "followers" | "friends" | "all"
     feedConfig.layout,        // "columns" | "wide" | "visual"
     feedConfig.sort,          // "recent" | "popularity"
-    feedConfig.contentType ?? null,  // (optional) "short" | "long" | "image" | "video" | "link" | "file"
+    feedConfig.contentType ?? null,  // (optional) "short" | "long" | "image" | "video" | "link" | "file" | "collection"
     feedConfig.name
   );
 
@@ -647,7 +645,7 @@ function PostCreator({ session, pubkyId }) {
         value={content}
         onChange={(e) => setContent(e.target.value)}
         placeholder="What's on your mind?"
-        maxLength={1000}
+        maxLength={2000}
       />
       <button type="submit" disabled={!content.trim()}>
         Post
